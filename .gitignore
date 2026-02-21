@@ -1,0 +1,14 @@
+# Build output
+Debug/
+Release/
+
+# IDE clutter
+*.launch
+.settings/
+.cproject
+.project
+
+# OS junk
+Thumbs.db
+.metadata/
+.mxproject
