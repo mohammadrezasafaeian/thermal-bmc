@@ -499,7 +499,7 @@ void ThermalApp_Loop(void) // <--- FIXED: No arguments needed yet
         {
         case EVT_PID_TICK:
             // Filter temp before PID sees it
-            pid_temp = pid_temp + 0.05f * (temp_c - pid_temp);
+            pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
 
                 // PID now sees filtered temperature
                 g_duty_cmd = PID_Update(&pid, g_setpoint_c, pid_temp);
