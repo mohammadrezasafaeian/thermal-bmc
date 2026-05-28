@@ -73,13 +73,13 @@ float PID_Update(PID_Handle *pid, float setpoint, float measured)
     float u = P + I + D;
     float u_clamped = u;
     if (u > 1.0f) u_clamped = 1.0f;
-    if (u < 0.0f) u_clamped = 0.0f;
+    if (u < -1.0f) u_clamped = -1.0f;
 
     /* 5. Anti‑windup (conditional integration) */
     if (pid->Ki > 0.0f && (u_clamped != u)) {
         /* If the output is stuck high and error is still positive, or
            stuck low and error is still negative, we undo the increment. */
-        if ((u > 1.0f && e > 0.0f) || (u < 0.0f && e < 0.0f)) {
+        if ((u > 1.0f && e > 0.0f) || (u < -1.0f && e < 0.0f)) {
             pid->integral -= 0.5f * pid->Ki * pid->Ts * (e + pid->e_prev);
         }
     }

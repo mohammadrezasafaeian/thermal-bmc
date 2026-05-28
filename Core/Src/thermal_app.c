@@ -226,25 +226,30 @@ static inline float ema_step(float state, float value, float alpha)
  *   CCR = ARR × duty   (ARR+1 ticks per period, CCR ticks HIGH)        */
 static void pwm_update(void)
 {
-    /* ── Heater (CH1) ─────────────────────────────── */
-    float htr = g_duty_cmd;
-    if (htr < 0.0f) htr = 0.0f;
-    if (htr > 1.0f) htr = 1.0f;
+    float cmd = g_duty_cmd;
+    if (cmd < -1.0f) cmd = -1.0f;
+    if (cmd >  1.0f) cmd =  1.0f;
 
     uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim3);
+
+    float heater_duty;
+    float fan_duty;
+
+    if (cmd >= 0.0f) {
+        heater_duty = cmd;
+        fan_duty    = 0.0f;
+    } else {
+        heater_duty = 0.0f;
+        fan_duty    = -cmd;
+    }
+
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1,
-                          (uint32_t)(htr * (float)arr));
-
-    /* ── Fan (CH2) ────────────────────────────────── */
-
-    /* ── Fan (CH2) ────────────────────────────────── */
-    float fn = g_fan_duty;
-    if (fn < 0.0f) fn = 0.0f;
-    if (fn > 1.0f) fn = 1.0f;
+                          (uint32_t)(heater_duty * (float)arr));
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2,
-                          (uint32_t)(fn * (float)arr));
-}
+                          (uint32_t)(fan_duty * (float)arr));
 
+    g_fan_duty = fan_duty;
+}
 /* ── log_sample ──────────────────────────────────────────────────────────
  *
  *   Appends one {time, temp, duty} entry to the ring buffer.
