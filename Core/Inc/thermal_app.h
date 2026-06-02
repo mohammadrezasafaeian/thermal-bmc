@@ -87,7 +87,40 @@ typedef struct {
     float heater_duty;
     float fan_duty;
 } ThermalLogEntry;
+/* ── FSM types (Topic 6) ─────────────────────────────────────────────── */
+typedef enum {
+    ST_IDLE = 0,   /* actuators OFF; sensors still read + displayed        */
+    ST_PID,        /* normal closed-loop control                           */
+    ST_COOLING,    /* graceful shutdown: fan runs until cool               */
+    ST_FAULT       /* safe state; forgiving auto-recover to IDLE           */
+} ThermalState;
 
+typedef enum {
+    FR_NONE = 0,
+    FR_NTC_OPEN,         /* divider rails HIGH → reads impossibly COLD     */
+    FR_NTC_SHORT,        /* divider rails LOW  → reads impossibly HOT      */
+    FR_HEATER_OPEN,      /* future: needs current shunt (Topic 11)         */
+    FR_FAN_OPEN,         /* future: needs TACH / current                   */
+    FR_ALL_DISCONNECTED  /* future                                         */
+} FaultReason;
+
+/* The unit of replication: write once, instantiate per zone. */
+typedef struct {
+    const char  *name;            /* "Z1" for OLED/diagnostics             */
+
+    ThermalState state;
+    FaultReason  fault_reason;    /* latched WHICH fault, for display      */
+    uint8_t      fault_count;     /* trip debounce  (faulty ticks)         */
+    uint8_t      recover_count;   /* recovery debounce (sane ticks)        */
+
+    volatile uint8_t start_req;   /* set by cmd/debugger, consumed by FSM  */
+    volatile uint8_t stop_req;
+    volatile uint8_t ack_req;     /* optional explicit fault ack           */
+
+    PID_Handle  pid;
+    float       setpoint_c;
+    float       duty_cmd;         /* this zone's output (-1..+1)           */
+} ZoneCtrl;
 /* ── Public globals (accessible from debugger / main.c) ─────────────────── */
 extern volatile float         g_duty_cmd;       /* PID output / manual duty  */
 extern volatile float         g_setpoint_c;     /* Desired temperature (°C)  */

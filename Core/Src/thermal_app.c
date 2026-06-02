@@ -55,11 +55,25 @@
 extern ADC_HandleTypeDef hadc1;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
-#define PID_KP     2.0f
-#define PID_KI     0.05f
-#define PID_KD     5.0f
+#define PID_KP     0.10f    /* was 2.0  — SIMC from measured plant */
+#define PID_KI     0.0008f  /* was 0.05 */
+#define PID_KD     0.0f     /* was 5.0  — first-order plant, no D */
 #define PID_TS     1.0f
 #define PID_TAU_F  10.0f
+/* ============================================================================
+ * OPEN-LOOP STEP TEST (for plant identification)
+ * ============================================================================
+ * Set OPEN_LOOP_TEST_MODE to 1 to bypass PID and apply a fixed-duty step.
+ * Used to measure plant gain K, time constant tau, and dead time theta.
+ * After the test, set it back to 0 to resume closed-loop PID control.
+ * ========================================================================== */
+#define OPEN_LOOP_TEST_MODE     0       /* 1 = step test, 0 = normal PID    */
+#define OPEN_LOOP_DUTY          0.5f    /* step magnitude (0.0 to 1.0)       */
+#define OPEN_LOOP_BASELINE_SEC  100      /* seconds at duty=0 before step     */
+#define OPEN_LOOP_RUN_SEC       1300     /* seconds to hold step (15 minutes) */
+
+/* Hardware safety — applies in BOTH modes. Cuts heater if temp exceeds. */
+#define MAX_SAFE_TEMP_C         80.0f
 /* ============================================================================
  * PUBLIC GLOBALS
  * ========================================================================== */
@@ -498,36 +512,61 @@ void ThermalApp_Loop(void) // <--- FIXED: No arguments needed yet
         switch (current_event) // <--- FIXED: C syntax with parentheses
         {
         case EVT_PID_TICK:
-            // Filter temp before PID sees it
+        {
+            /* 1-second tick counter (since boot). Used by open-loop step logic. */
+            static uint32_t tick_count = 0;
+            tick_count++;
+
+            /* Keep the input-side EMA running so it's warmed up when we
+             * switch back to closed-loop mode. In open-loop mode it's unused. */
             pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
 
-                // PID now sees filtered temperature
-                g_duty_cmd = PID_Update(&pid, g_setpoint_c, pid_temp);
+        #if OPEN_LOOP_TEST_MODE
+            /* === OPEN-LOOP STEP TEST === */
+            if (tick_count <= OPEN_LOOP_BASELINE_SEC) {
+                g_duty_cmd = 0.0f;                       /* baseline */
+            } else if (tick_count <= OPEN_LOOP_BASELINE_SEC + OPEN_LOOP_RUN_SEC) {
+                g_duty_cmd = OPEN_LOOP_DUTY;             /* step applied */
+            } else {
+                g_duty_cmd = 0.0f;                       /* test complete, cool down */
+            }
+        #else
+            /* === NORMAL CLOSED-LOOP PID === */
+            g_duty_cmd = PID_Update(&pid, g_setpoint_c, pid_temp);
+        #endif
 
-                // 2. Update EMA Filters (Copied from old loop)
-                if (!ema_initialized) {
-                    ema_temp_display = temp_c;
-                    ema_mean         = temp_c;
-                    ema_dev          = 1.0f;
-                    ema_initialized  = 1;
-                } else {
-                    ema_temp_display = ema_step(ema_temp_display, temp_c, THERM_EMA_DISPLAY);
-                    ema_mean = ema_step(ema_mean, ema_temp_display, THERM_EMA_MEAN);
+            /* === SAFETY CUTOFF — applies in BOTH modes ===
+             * Uses RAW temperature (no EMA lag) so safety responds fast. */
+            if (temp_c > MAX_SAFE_TEMP_C) {
+                g_duty_cmd = 0.0f;
+            }
 
-                    float abs_dev = ema_temp_display - ema_mean;
-                    if (abs_dev < 0.0f) abs_dev = -abs_dev;
-                    ema_dev = ema_step(ema_dev, abs_dev, THERM_EMA_DEV);
-                    if (ema_dev < 0.05f) ema_dev = 0.05f;
-                }
+            /* === Display-side EMAs (unchanged from before) === */
+            if (!ema_initialized) {
+                ema_temp_display = temp_c;
+                ema_mean         = temp_c;
+                ema_dev          = 1.0f;
+                ema_initialized  = 1;
+            } else {
+                ema_temp_display = ema_step(ema_temp_display, temp_c, THERM_EMA_DISPLAY);
+                ema_mean = ema_step(ema_mean, ema_temp_display, THERM_EMA_MEAN);
+                float abs_dev = ema_temp_display - ema_mean;
+                if (abs_dev < 0.0f) abs_dev = -abs_dev;
+                ema_dev = ema_step(ema_dev, abs_dev, THERM_EMA_DEV);
+                if (ema_dev < 0.05f) ema_dev = 0.05f;
+            }
 
-                // 3. Update Plot Buffer
-                plot_buf[plot_head] = ema_temp_display;
-                plot_head = (uint8_t)((plot_head + 1) % THERM_PLOT_LEN);
+            /* Plot buffer for OLED — still uses smoothed value (just for display) */
+            plot_buf[plot_head] = ema_temp_display;
+            plot_head = (uint8_t)((plot_head + 1) % THERM_PLOT_LEN);
 
-                // 4. Log Data
-                log_sample(ema_temp_display, g_duty_cmd, g_fan_duty);
-                break; // <--- CRITICAL: Don't fall through to other cases!
+            /* === LOG RAW TEMPERATURE === (critical for plant identification!)
+             * For plant ID we MUST log temp_c (raw), not ema_temp_display.
+             * The EMA is part of what we're trying to characterize separately. */
+            log_sample(temp_c, g_duty_cmd, g_fan_duty);
 
+            break;
+        }
             case EVT_START_CMD:
                 // Optional: Handle manual start later
                 break;
