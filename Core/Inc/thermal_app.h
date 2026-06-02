@@ -1,135 +1,188 @@
 /* ==========================================================================
- * thermal_app.h  —  Thermal Logger with PID Controller
- * Target : STM32F411CEU6 "Black Pill" @ 100 MHz  (STM32CubeIDE + HAL)
- * ==========================================================================
- *
- *  SENSOR WIRING  (flipped divider for low‑Ohm NTC)
- *  ─────────────────────────────────────────────────
- *
- *   5.0 V (USB) ──┬── R_top = 330 Ω ──┬── NTC 10D‑9 (~10 Ω) ── GND
- *                  │                    │
- *                  │                   PA0 (ADC1_IN0)
- *                  │                   (NODE voltage)
- *
- *   As temperature ↑  →  R_ntc ↓  →  V_node ↑  (approaches 3.3 V)
- *   The ADC reference is 3.3 V; VSUP is 5.0 V.
- *
- *  HEATER WIRING
- *  ─────────────
- *   PA6 (TIM3_CH1 PWM) ──► IRLZ44N gate ──► 10 Ω / 5 W ──► USB 5 V
- *
- *  REQUIRED CubeMX SETTINGS  (configure BEFORE using this module)
- *  ──────────────────────────────────────────────────────────────
- *   ADC1  : Channel IN0 (PA0), 12‑bit, right‑align, software trigger,
- *            single‑conversion mode, NO DMA, scan disabled.
- *
- *   TIM3  : Prescaler = 99, Counter Period = 999, no reload preload,
- *            Channel 1 = PWM Generation CH1, PA6 assigned to TIM3_CH1.
- *            → PWM frequency = 100 MHz / 100 / 1000 = 1 kHz
- *
- *   I2C1  : Already configured for the SSD1306 (keep as‑is).
- *
+ * thermal_app.h  --  Thermal Logger with per-zone FSM + PID
+ * Target : STM32F411CEU6 @ 100 MHz  (STM32CubeIDE + HAL)
  * ========================================================================== */
-/* ==========================================================================
- * thermal_app.h  —  Thermal Logger configuration & public API
- * ========================================================================== */
-
-#ifndef THERMAL_APP_H
-#define THERMAL_APP_H
+#ifndef INC_THERMAL_APP_H_
+#define INC_THERMAL_APP_H_
 
 #include "stm32f4xx_hal.h"
+#include "pid.h"
 #include <stdint.h>
-#include "pid.h"                // PID controller (your tuned gains)
 
-/* ── Divider constants ──────────────────────────────────────────────────────
- *
- *  Wiring: VSUP (5.0 V) → R_top (330 Ω) → NODE (PA0) → NTC (10D‑9) → GND
- *
- *  THERM_ADC_VREF  – voltage the ADC uses to map counts → volts (3.3 V)
- *  THERM_DIV_VSUP  – actual supply rail of the divider (5.0 V from USB)
- *  THERM_RTOP      – top resistor value (Ω)
- *
- *  To power the divider from 3.3 V instead (recommended for MCU safety):
- *    #define THERM_DIV_VSUP   3.3f
- *  No other code changes are needed.                                        */
-#define THERM_ADC_VREF      3.3f
-#define THERM_DIV_VSUP      5.0f
-#define THERM_RTOP          330.0f
+/* ============================================================================
+ * HARDWARE / DIVIDER CONSTANTS
+ *   Divider: 5V -- R_top(330R) -- NODE -- NTC(~10R cold) -- GND
+ *   ADC measures V_node with VREF = 3.3 V.
+ *   Temperature rises -> R_ntc falls -> V_node falls (closer to 0 V).
+ * ========================================================================== */
+#define THERM_RTOP            330.0f    /* top resistor (ohms)                */
+#define THERM_DIV_VSUP        5.0f      /* divider supply (V)                 */
+#define THERM_ADC_VREF        3.3f      /* ADC reference (V)                  */
+#define THERM_BETA            3500.0f   /* NTC Beta (K), approx for 10D-9     */
+#define THERM_R0              10.0f     /* NTC R at T0 (ohms)                 */
+#define THERM_T0_K            298.15f   /* T0 in Kelvin (25 C)                */
 
-/* ── NTC Beta model ─────────────────────────────────────────────────────── */
-#define THERM_R0            10.0f       /* Nominal NTC resistance @ T0 (Ω)  */
-#define THERM_T0_K          298.15f     /* Reference temperature (25 °C)     */
-#define THERM_BETA          3500.0f     /* Beta coefficient (K) — recalibrate*/
+/* ============================================================================
+ * SAMPLING / DISPLAY CONSTANTS
+ * ========================================================================== */
+#define THERM_ADC_OVERSAMPLE  128
+#define THERM_LOG_LEN         2048
+#define THERM_PLOT_LEN        128
+#define THERM_OLED_DIVIDER    1
 
-/* ── Sampling ───────────────────────────────────────────────────────────── */
-#define THERM_ADC_OVERSAMPLE  128        /* Conversions averaged per iteration*/
-#define THERM_SAMPLE_MS       1000       /* Target loop period (ms) → 1 Hz   */
+/* Plot auto-scaling */
+#define THERM_PLOT_K          3.0f      /* half-span = K * ema_dev            */
+#define THERM_PLOT_MIN_SPAN   2.0f      /* never zoom in tighter than this    */
 
-/* ── EMA filter coefficients (0 < alpha ≤ 1; smaller = smoother) ────────── */
-#define THERM_EMA_DISPLAY   0.05f        /* Display/log smoothing             */
-#define THERM_EMA_MEAN      0.01f        /* Slow mean tracker (plot centre)   */
-#define THERM_EMA_DEV       0.05f        /* Mean‑abs‑deviation (plot scale)   */
+/* Display-side EMAs (slow, for human-readable plot) */
+#define THERM_EMA_DISPLAY     0.20f
+#define THERM_EMA_MEAN        0.02f
+#define THERM_EMA_DEV         0.02f
 
-/* ── OLED plot ──────────────────────────────────────────────────────────── */
-#define THERM_PLOT_LEN      128          /* Ring‑buffer length = OLED width   */
-#define THERM_PLOT_K        3.0f         /* Half‑span multiplier (× ema_dev)  */
-#define THERM_PLOT_MIN_SPAN 2.0f         /* Minimum full‑scale span (°C)      */
-#define THERM_OLED_DIVIDER  1            /* Refresh OLED every N samples      */
+/* ============================================================================
+ * PID GAINS (SIMC from measured plant: K~17, tau~111, theta~10)
+ * ========================================================================== */
+#define PID_KP                0.10f
+#define PID_KI                0.0008f
+#define PID_KD                0.0f
+#define PID_TS                1.0f      /* tick period (s)                    */
+#define PID_TAU_F             10.0f     /* derivative filter time const       */
 
-/* ── RAM log ────────────────────────────────────────────────────────────── */
-#define THERM_LOG_LEN       2048         /* Entries; 2048 × 12 B = 24 576 B   */
+/* ============================================================================
+ * OPEN-LOOP STEP TEST  (set MODE=0 for normal closed-loop)
+ * ========================================================================== */
+#define OPEN_LOOP_TEST_MODE       0
+#define OPEN_LOOP_DUTY            0.5f
+#define OPEN_LOOP_BASELINE_SEC    100
+#define OPEN_LOOP_RUN_SEC         1300
 
-/* ── Log entry ──────────────────────────────────────────────────────────── */
+/* ============================================================================
+ * SAFETY
+ *   MAX_SAFE_TEMP_C  : real overtemperature (sensor TRUSTED, plant too hot)
+ *   FR_NTC_SHORT     : sensor LYING about being hot (different root cause)
+ *   These are distinct and demand different responses - do not merge them.
+ * ========================================================================== */
+#define MAX_SAFE_TEMP_C       80.0f
+
+/* ============================================================================
+ * STATE MACHINE - TYPES
+ * ========================================================================== */
+
+/* ---- States: WHAT the zone is doing right now ---------------------------- */
+typedef enum {
+    ST_IDLE    = 0,   /* actuators off, sensors live, waiting for start_req   */
+    ST_PID     = 1,   /* normal closed-loop control                            */
+    ST_COOLING = 2,   /* graceful shutdown: fan forced on until cool & sane    */
+    ST_FAULT   = 3    /* sensor lying or hardware fault; safe-park             */
+} ThermalState;
+
+/* ---- Fault reasons: WHY we tripped --------------------------------------- *
+ *   FR_NONE         : healthy
+ *   FR_NTC_OPEN     : V_node hugs ADC top rail -> NTC disconnected
+ *   FR_NTC_SHORT    : V_node ~ 0 V             -> NTC shorted (LIES "hot")
+ *   FR_HEATER_OPEN  : Topic 11 hook - needs current shunt
+ *   FR_FAN_OPEN     : Topic 11 hook
+ *   FR_ALL_DISCONNECTED : composite (deferred)                              */
+typedef enum {
+    FR_NONE             = 0,
+    FR_NTC_OPEN         = 1,
+    FR_NTC_SHORT        = 2,
+    FR_HEATER_OPEN      = 3,
+    FR_FAN_OPEN         = 4,
+    FR_ALL_DISCONNECTED = 5
+} FaultReason;
+
+/* ============================================================================
+ * VOLTAGE-BASED FAULT THRESHOLDS  (derived in EX-1)
+ *   Normal V_node = 75..147 mV (hugs GND, far from 3.3 V rail).
+ *   OPEN  : ~3.3 V (clamp). Detection margin huge.
+ *   SHORT : ~0 V. Detection margin TIGHT (~93 LSB on 12-bit; ~15 on AVR 10-bit
+ *           - landmine for the future AVR port).
+ * ========================================================================== */
+#define V_OPEN_THRESH         2.5f      /* > this  -> NTC open                */
+#define V_SHORT_THRESH        0.05f   /* < this  -> NTC short               */
+
+/* ============================================================================
+ * FAULT DEBOUNCE  (time-domain Schmitt; integer count on RAW signal, not EMA)
+ *   M >> N by design: hysteresis-in-time defeats limit-cycle chatter (EX-5).
+ * ========================================================================== */
+#define FAULT_TRIP_N          3         /* faulty ticks to trip IDLE/PID->FAULT*/
+#define FAULT_RECOVER_M       10        /* sane ticks to recover FAULT->IDLE  */
+
+/* ============================================================================
+ * COOLING parameters
+ *   COOL_THRESH_C        : "cool enough to stop" temperature
+ *   COOLING_TIMEOUT_TICKS: ~3 * tau backstop - cool even if sensor is lying
+ * ========================================================================== */
+#define COOL_THRESH_C            35.0f
+#define COOLING_TIMEOUT_TICKS    400    /* ~6.5 min at 1 Hz (3 * tau_eff)     */
+
+/* ============================================================================
+ * ZoneCtrl - the unit of replication
+ *   One instance per physical zone. All per-zone state lives here so:
+ *     - Zone 1 FAULT cannot halt Zone 2 (fault isolation)
+ *     - PID integrator + debounce counters reset cleanly on entry (bumpless)
+ *     - trivially becomes a FreeRTOS task body in Topic 8
+ *     - trivially becomes a remote node over I2C in Topic 9
+ * ========================================================================== */
+typedef struct {
+    const char     *name;            /* "Z1", "Z2" - for OLED/logs            */
+    ThermalState    state;
+    FaultReason     fault_reason;    /* committed fault (latched until recover)*/
+    uint8_t         fault_count;     /* debounce: ticks signal looked faulty  */
+    uint8_t         recover_count;   /* debounce: ticks signal looked sane    */
+    uint16_t        cool_ticks;      /* COOLING timeout counter               */
+
+    /* Command flags - written by debugger/UI/comms, consumed by FSM ---------*
+     * volatile: writes can come from any context (ISR, debugger, future task) */
+    volatile uint8_t start_req;
+    volatile uint8_t stop_req;
+    volatile uint8_t ack_req;        /* future: clear a sticky fault          */
+
+    /* Control state -------------------------------------------------------- */
+    PID_Handle      pid;
+    float           setpoint_c;
+    float           duty_cmd;        /* PID output [-1..+1], mirrored global  */
+} ZoneCtrl;
+
+/* ============================================================================
+ * PUBLIC GLOBALS  (defined in thermal_app.c)
+ * ========================================================================== */
+extern ZoneCtrl zone1;
+
+extern volatile float g_duty_cmd;
+extern volatile float g_setpoint_c;     /* kept for legacy Live Expressions   */
+extern volatile float g_fan_duty;
+extern PID_Handle pid;                  /* legacy alias, points at zone1.pid  */
+
+/* Log buffer (exported via Memory Browser) */
 typedef struct {
     float time_s;
     float temp_c;
-    float setpoint_c;    /* ← add this */
+    float setpoint_c;
     float heater_duty;
     float fan_duty;
 } ThermalLogEntry;
-/* ── FSM types (Topic 6) ─────────────────────────────────────────────── */
-typedef enum {
-    ST_IDLE = 0,   /* actuators OFF; sensors still read + displayed        */
-    ST_PID,        /* normal closed-loop control                           */
-    ST_COOLING,    /* graceful shutdown: fan runs until cool               */
-    ST_FAULT       /* safe state; forgiving auto-recover to IDLE           */
-} ThermalState;
 
-typedef enum {
-    FR_NONE = 0,
-    FR_NTC_OPEN,         /* divider rails HIGH → reads impossibly COLD     */
-    FR_NTC_SHORT,        /* divider rails LOW  → reads impossibly HOT      */
-    FR_HEATER_OPEN,      /* future: needs current shunt (Topic 11)         */
-    FR_FAN_OPEN,         /* future: needs TACH / current                   */
-    FR_ALL_DISCONNECTED  /* future                                         */
-} FaultReason;
+extern ThermalLogEntry thermal_log[THERM_LOG_LEN];
+extern volatile uint32_t thermal_log_idx;
 
-/* The unit of replication: write once, instantiate per zone. */
-typedef struct {
-    const char  *name;            /* "Z1" for OLED/diagnostics             */
+/* Debug read-back (Live Expressions) */
+extern volatile uint32_t dbg_adc_avg;
+extern volatile float    dbg_vnode;
+extern volatile float    dbg_rntc;
+extern volatile float    dbg_temp_c;
 
-    ThermalState state;
-    FaultReason  fault_reason;    /* latched WHICH fault, for display      */
-    uint8_t      fault_count;     /* trip debounce  (faulty ticks)         */
-    uint8_t      recover_count;   /* recovery debounce (sane ticks)        */
-
-    volatile uint8_t start_req;   /* set by cmd/debugger, consumed by FSM  */
-    volatile uint8_t stop_req;
-    volatile uint8_t ack_req;     /* optional explicit fault ack           */
-
-    PID_Handle  pid;
-    float       setpoint_c;
-    float       duty_cmd;         /* this zone's output (-1..+1)           */
-} ZoneCtrl;
-/* ── Public globals (accessible from debugger / main.c) ─────────────────── */
-extern volatile float         g_duty_cmd;       /* PID output / manual duty  */
-extern volatile float         g_setpoint_c;     /* Desired temperature (°C)  */
-extern          ThermalLogEntry thermal_log[THERM_LOG_LEN];
-extern volatile uint32_t      thermal_log_idx;
-extern PID_Handle             pid;              /* PID state – watch integral,deriv */
-extern volatile float g_fan_duty;   /* Manual fan control (0.0–1.0)  */
-/* ── Public API ─────────────────────────────────────────────────────────── */
+/* ============================================================================
+ * PUBLIC API
+ * ========================================================================== */
 void ThermalApp_Init(void);
 void ThermalApp_Loop(void);
 
-#endif /* THERMAL_APP_H */
+/* Tick the FSM. Called from EVT_PID_TICK with all signals it needs.
+ *   vnode    : RAW node voltage  (safety path - no EMA lag)
+ *   raw_t_c  : RAW temperature   (log, threshold checks)
+ *   ema_t_c  : EMA-filtered temp (control path - feeds PID)                  */
+void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c);
+
+#endif /* INC_THERMAL_APP_H_ */
