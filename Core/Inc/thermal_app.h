@@ -155,17 +155,56 @@ extern volatile float g_setpoint_c;     /* kept for legacy Live Expressions   */
 extern volatile float g_fan_duty;
 extern PID_Handle pid;                  /* legacy alias, points at zone1.pid  */
 
-/* Log buffer (exported via Memory Browser) */
+/* ============================================================================
+ * DUAL LOG STREAMS
+ *
+ * Stream 1 (DENSE) - continuous physics, one entry per tick.
+ *   Things that always change because of physical dynamics.
+ *
+ * Stream 2 (SPARSE) - discrete events, one entry per CHANGE.
+ *   Things that mostly stay constant; logging every tick is waste.
+ *
+ * Edge-detected in ThermalApp_Loop using sentinel-init "last seen" vars,
+ * so the first tick always emits the boot state as event #0.
+ * ========================================================================== */
+
+/* ---- Stream 1: per-tick time series --------------------------------------*/
 typedef struct {
     float time_s;
-    float temp_c;
-    float setpoint_c;
-    float heater_duty;
-    float fan_duty;
-} ThermalLogEntry;
+    float temp_c;       /* raw temperature                                   */
+    float temp_ema;     /* EMA-filtered temp (what PID actually saw)         */
+    float vnode;        /* raw ADC voltage - sensor truth, fault forensics   */
+    float duty_cmd;     /* signed [-1..+1]; sign splits heater/fan downstream*/
+} ThermalLogEntry;      /* 20 bytes - same footprint as before, more info    */
 
+/* ---- Stream 2: event kinds -----------------------------------------------*/
+typedef enum {
+    EV_NONE          = 0,
+    EV_STATE_CHANGE  = 1,   /* u8_payload = new ThermalState                 */
+    EV_FAULT_RAISED  = 2,   /* u8_payload = FaultReason                      */
+    EV_FAULT_CLEARED = 3,   /* u8_payload = previous FaultReason             */
+    EV_SETPOINT_CHG  = 4,   /* f_payload  = new setpoint (°C)                */
+    EV_START_REQ     = 5,
+    EV_STOP_REQ      = 6,
+} EventKind;
+
+typedef struct {
+    float    time_s;
+    uint8_t  kind;          /* EventKind                                     */
+    uint8_t  u8_payload;
+    uint16_t _pad;          /* keep struct 12-byte, naturally aligned        */
+    float    f_payload;
+} ThermalEvent;             /* 12 bytes                                      */
+
+#define THERM_EVENT_LEN     64      /* 64 × 12 = 768 B - plenty              */
+
+/* ---- Globals (defined in thermal_app.c) ----------------------------------*/
 extern ThermalLogEntry thermal_log[THERM_LOG_LEN];
 extern volatile uint32_t thermal_log_idx;
+
+extern ThermalEvent thermal_events[THERM_EVENT_LEN];
+extern volatile uint32_t thermal_event_idx;
+
 
 /* Debug read-back (Live Expressions) */
 extern volatile uint32_t dbg_adc_avg;

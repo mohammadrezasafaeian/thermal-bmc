@@ -59,6 +59,10 @@ __attribute__((aligned(4)))
 ThermalLogEntry thermal_log[THERM_LOG_LEN];
 volatile uint32_t thermal_log_idx = 0;
 
+__attribute__((aligned(4)))
+ThermalEvent thermal_events[THERM_EVENT_LEN];
+volatile uint32_t thermal_event_idx = 0;
+
 /* Debug read-back globals */
 volatile uint32_t dbg_adc_avg = 0;
 volatile float    dbg_vnode   = 0.0f;
@@ -145,19 +149,63 @@ static void pwm_update(void)
 }
 
 /* ============================================================================
- * LOG
+ * STREAM 1 - dense per-tick log
  * ========================================================================== */
-static void log_sample(float temp_c, float heater_duty, float fan_duty)
+static void log_sample(float temp_c, float temp_ema, float vnode, float duty)
 {
     uint32_t idx = thermal_log_idx % THERM_LOG_LEN;
-    thermal_log[idx].time_s      = HAL_GetTick() * 0.001f;
-    thermal_log[idx].temp_c      = temp_c;
-    thermal_log[idx].setpoint_c  = zone1.setpoint_c;
-    thermal_log[idx].heater_duty = heater_duty;
-    thermal_log[idx].fan_duty    = fan_duty;
+    thermal_log[idx].time_s   = HAL_GetTick() * 0.001f;
+    thermal_log[idx].temp_c   = temp_c;
+    thermal_log[idx].temp_ema = temp_ema;
+    thermal_log[idx].vnode    = vnode;
+    thermal_log[idx].duty_cmd = duty;
     thermal_log_idx++;
 }
 
+/* ============================================================================
+ * STREAM 2 - sparse event log (one entry per CHANGE)
+ *   Pushed by emit_change_events() each tick; also pushed by ThermalApp_Init
+ *   for the boot state.
+ * ========================================================================== */
+static void event_log(EventKind kind, uint8_t u8, float f)
+{
+    uint32_t idx = thermal_event_idx % THERM_EVENT_LEN;
+    thermal_events[idx].time_s     = HAL_GetTick() * 0.001f;
+    thermal_events[idx].kind       = (uint8_t)kind;
+    thermal_events[idx].u8_payload = u8;
+    thermal_events[idx]._pad       = 0;
+    thermal_events[idx].f_payload  = f;
+    thermal_event_idx++;
+}
+
+/* ---- emit_change_events: edge detector ---------------------------------- *
+ *   Sentinel-init "last seen" cache forces first-tick logging of boot state.
+ *   Pattern is identical to a hardware rising-edge detector: store previous,
+ *   compare to current, emit on disagreement, update the cache.            */
+static void emit_change_events(ZoneCtrl *z)
+{
+    static uint8_t last_state        = 0xFF;     /* impossible -> first tick logs */
+    static uint8_t last_fault_reason = 0xFF;
+    static float   last_setpoint     = -1000.0f; /* impossible setpoint           */
+
+    if (z->state != last_state) {
+        event_log(EV_STATE_CHANGE, z->state, 0.0f);
+        last_state = z->state;
+    }
+
+    if (z->fault_reason != last_fault_reason) {
+        if (z->fault_reason == FR_NONE)
+            event_log(EV_FAULT_CLEARED, last_fault_reason, 0.0f);
+        else
+            event_log(EV_FAULT_RAISED,  z->fault_reason,   0.0f);
+        last_fault_reason = z->fault_reason;
+    }
+
+    if (z->setpoint_c != last_setpoint) {
+        event_log(EV_SETPOINT_CHG, 0, z->setpoint_c);
+        last_setpoint = z->setpoint_c;
+    }
+}
 /* ============================================================================
  * OLED  (unchanged - just renders whatever's in plot_buf + globals)
  * ========================================================================== */
@@ -256,6 +304,7 @@ static void zone_actuators_off(ZoneCtrl *z)
  *   fault_count also reset: we're trusting the sensor again from this tick. */
 static void zone_enter_pid(ZoneCtrl *z, float seed_temp_c)
 {
+    pid_temp = seed_temp_c;              // ← snap EMA to current truth
     PID_Init(&z->pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, seed_temp_c);
     z->fault_count   = 0;
     z->recover_count = 0;
@@ -304,9 +353,10 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
 
         if (z->start_req) {
             z->start_req = 0;
+            // In Zone_Tick, the ST_IDLE case:
             if (fault_candidate == FR_NONE) {
-                zone_enter_pid(z, ema_t_c);
-            } else {
+                zone_enter_pid(z, raw_t_c);     // was ema_t_c — pass RAW so snap is meaningful
+            }else {
                 zone_enter_fault(z, fault_candidate);
             }
         }
@@ -412,7 +462,8 @@ void ThermalApp_Init(void)
     plot_head = 0;
     memset(thermal_log, 0, sizeof(thermal_log));
     thermal_log_idx = 0;
-
+    memset(thermal_events, 0, sizeof(thermal_events));
+    thermal_event_idx = 0;
     /* 4. Initial temperature reading (seeds PID derivative + EMA) */
     uint32_t adc_raw   = adc_average(THERM_ADC_OVERSAMPLE);
     float    init_rntc = adc_to_rntc(adc_raw);
@@ -465,8 +516,14 @@ void ThermalApp_Loop(void)
             tick_count++;
 
             /* Control-path EMA (slow, noise-reject). SAFETY uses raw vnode. */
-            pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
+            // In ThermalApp_Loop, EVT_PID_TICK case:
+            // OLD (always runs):
+            //   pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
 
+            // NEW (only runs when controller is alive):
+            if (zone1.state == ST_PID) {
+                pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
+            }
         #if OPEN_LOOP_TEST_MODE
             /* Bypass FSM entirely for plant ID step test. */
             if (tick_count <= OPEN_LOOP_BASELINE_SEC) {
@@ -507,8 +564,11 @@ void ThermalApp_Loop(void)
 
             /* Log RAW temperature (not EMA): plant ID needs the un-filtered
              * signal so the filter can be characterised separately.        */
-            log_sample(temp_c, g_duty_cmd, g_fan_duty);
-            break;
+            /* Stream 1: dense per-tick data */
+            log_sample(temp_c, pid_temp, vnode, g_duty_cmd);
+
+            /* Stream 2: edge-detected sparse events */
+            emit_change_events(&zone1);            break;
         }
 
         case EVT_START_CMD:
