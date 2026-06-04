@@ -33,6 +33,10 @@
 #include <string.h>
 #include <stdint.h>
 
+#define THERMAL_LOG_MAGIC  0xC0FFEE42u
+
+__attribute__((section(".noinit")))
+uint32_t thermal_log_magic;
 /* ── HAL handles (from CubeMX, in main.c) ───────────────────────────────── */
 extern ADC_HandleTypeDef hadc1;
 extern TIM_HandleTypeDef htim2;
@@ -55,13 +59,17 @@ volatile float g_fan_duty   = 0.0f;
 
 PID_Handle pid;                          /* legacy alias - copy from zone1    */
 
-__attribute__((aligned(4)))
+__attribute__((aligned(4), section(".noinit")))
 ThermalLogEntry thermal_log[THERM_LOG_LEN];
-volatile uint32_t thermal_log_idx = 0;
 
-__attribute__((aligned(4)))
+__attribute__((aligned(4), section(".noinit")))
 ThermalEvent thermal_events[THERM_EVENT_LEN];
-volatile uint32_t thermal_event_idx = 0;
+
+__attribute__((section(".noinit")))
+volatile uint32_t thermal_log_idx;
+
+__attribute__((section(".noinit")))
+volatile uint32_t thermal_event_idx;
 
 /* Debug read-back globals */
 volatile uint32_t dbg_adc_avg = 0;
@@ -457,13 +465,21 @@ void ThermalApp_Init(void)
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
 
-    /* 3. Zero display + log buffers */
-    memset(plot_buf,    0, sizeof(plot_buf));
+    /* plot_buf is not in .noinit — always clear (display state, not log). */
+    memset(plot_buf, 0, sizeof(plot_buf));
     plot_head = 0;
-    memset(thermal_log, 0, sizeof(thermal_log));
-    thermal_log_idx = 0;
-    memset(thermal_events, 0, sizeof(thermal_events));
-    thermal_event_idx = 0;
+
+    /* Black-box logs: only clear on COLD boot. Magic word distinguishes. */
+    if (thermal_log_magic != THERMAL_LOG_MAGIC) {
+        /* Cold boot: random garbage in .noinit. Clear and stamp the magic. */
+        memset(thermal_log,    0, sizeof(thermal_log));
+        memset(thermal_events, 0, sizeof(thermal_events));
+        thermal_log_idx   = 0;
+        thermal_event_idx = 0;
+        thermal_log_magic = THERMAL_LOG_MAGIC;   /* stamp for next reset */
+    }
+    /* On warm boot: do nothing — buffers retain previous run's data. */
+
     /* 4. Initial temperature reading (seeds PID derivative + EMA) */
     uint32_t adc_raw   = adc_average(THERM_ADC_OVERSAMPLE);
     float    init_rntc = adc_to_rntc(adc_raw);
