@@ -3,9 +3,14 @@
 parse_struct_dump.py - STM32 thermal controller portfolio plotter.
 
 Three figures, one capture:
-  Figure 1 (overview)     -> run1_overview.png      Title + temperature + duty.
-  Figure 2 (detail)       -> run1_detail.png        FSM diagram + fault zooms.
-  Figure 3 (walkthrough)  -> run1_walkthrough.png   FSM ref + pivot insets + strip.
+  Figure 1 (overview)     -> *_overview.png      KPIs + temperature + actuator drive.
+  Figure 2 (detail)       -> *_detail.png        FSM diagram + fault zooms.
+  Figure 3 (walkthrough)  -> *_walkthrough.png   FSM ref + pivot insets + strip.
+
+Design: every figure carries two layers.
+  - 5-second layer : KPI pills, plain-language labels, story callouts.
+  - 60-second layer: raw + filtered traces, sensor voltage, FSM counts,
+                     exact timestamps. Nothing technical is removed.
 """
 
 import argparse
@@ -14,21 +19,49 @@ import sys
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, FancyBboxPatch, FancyArrowPatch
+from matplotlib.patches import (Rectangle, FancyBboxPatch, FancyArrowPatch,
+                                Patch)
 
 DISP = 2
 TEMP_VALID_LO, TEMP_VALID_HI = -10.0, 100.0   # 10D-9 NTC physical sanity range
+
+FIG_W = 14.0    # one width for all figures -> identical font scale in LaTeX
+DPI = 200
 
 # ----- Palette ------------------------------------------------------------
 C_BG, C_INK, C_INK_SOFT = '#ffffff', '#1f2933', '#6b7280'
 C_GRID = '#e5e7eb'
 C_TEMP_RAW, C_TEMP_EMA, C_SETPOINT = '#d1d5db', '#d97706', '#1f2933'
+C_BAND = '#9ca3af'
 C_HEATER, C_FAN = '#ea580c', '#0369a1'
 C_VNODE, C_FAULT = '#7c3aed', '#b91c1c'
 C_PID, C_COOLING, C_IDLE = '#15803d', '#0369a1', '#9ca3af'
 C_BADGE_BG, C_BADGE_ED = '#fef3c7', '#92400e'
+C_PILL_BG, C_PILL_ED = '#f5f7fa', '#cbd5e1'
 
 STATE_COLORS = {0: C_IDLE, 1: C_PID, 2: C_COOLING, 3: C_FAULT}
+
+# ----- Labels: plain language first, technical term kept in parens --------
+LBL = {
+    'temp_raw': 'Raw temperature',
+    'temp_ema': 'Filtered temp (EMA \u2192 PID input)',
+    'setpoint': 'Target (setpoint)',
+    'band':     'target band',
+    'vnode':    'NTC sensor voltage (vnode)',
+    'heater':   'Heater drive',
+    'fan':      'Fan drive',
+    'duty_ax':  'Actuator drive (%)',
+}
+
+# Human-readable fault causes (enum kept in terminal trace)
+FAULT_HUMAN = {
+    'NONE':             'none',
+    'NTC_OPEN':         'NTC open (wire cut)',
+    'NTC_SHORT':        'NTC shorted',
+    'HEATER_OPEN':      'heater open',
+    'FAN_OPEN':         'fan open',
+    'ALL_DISCONNECTED': 'all sensors lost',
+}
 
 
 # =========================================================================
@@ -91,6 +124,10 @@ EVT_DTYPE = np.dtype([('time_s', '<f4'), ('kind', 'u1'),
                       ('f_payload', '<f4')])
 
 
+def fault_human(enum_name):
+    return FAULT_HUMAN.get(enum_name, enum_name.replace('_', ' ').lower())
+
+
 def parse_events_from_expressions(text):
     entries = re.findall(r'\{([^{}]*=[^{}]*)\}', text)
     parsed = []
@@ -129,7 +166,8 @@ def print_events(events):
         if name == 'STATE_CHANGE':
             extra = " -> {}".format(STATE_NAMES.get(int(e['u8_payload']), '?'))
         elif name in ('FAULT_RAISED', 'FAULT_CLEARED'):
-            extra = " ({})".format(FAULT_NAMES.get(int(e['u8_payload']), '?'))
+            enum = FAULT_NAMES.get(int(e['u8_payload']), '?')
+            extra = " ({} = {})".format(enum, fault_human(enum))
         elif name == 'SETPOINT_CHG':
             extra = " {:.2f} C".format(float(e['f_payload']))
         print("  t={:8.2f}s  {}{}".format(float(e['time_s']), name, extra))
@@ -213,6 +251,72 @@ def count_transitions(events):
 
 
 # =========================================================================
+# KPI COMPUTATION (the recruiter hook -- computed honestly)
+# =========================================================================
+def settled_pid_mask(t, events, t_end, settle_s):
+    """True where the controller is in PID *and* past the settling window
+    after any setpoint change or entry into PID. Excluding transients keeps
+    the tracking-accuracy KPI honest: a 10 C step is not a tracking error."""
+    mask = np.zeros(len(t), dtype=bool)
+    for (t0, t1, st) in state_intervals(events, t_end):
+        if st == 1:
+            mask |= (t >= t0) & (t <= t1)
+
+    if events is not None:
+        disturb_times = []
+        for e in events:
+            k = int(e['kind'])
+            if k == EV_SETPOINT_CHG:
+                disturb_times.append(float(e['time_s']))
+            elif k == EV_STATE_CHANGE and int(e['u8_payload']) == 1:
+                disturb_times.append(float(e['time_s']))   # PID (re)entry
+        for td in disturb_times:
+            mask &= ~((t >= td) & (t < td + settle_s))
+    return mask
+
+
+def compute_kpis(t, temp_ema_c, events, t_end, band, settle_s):
+    """Returns (pill_list, stats_dict). Pills: list of (value, label)."""
+    stats = {}
+    pills = []
+
+    # --- tracking accuracy ---
+    sp_t, sp_v = setpoint_steps(events, t_end)
+    if sp_t is not None and temp_ema_c is not None:
+        # piecewise-constant setpoint evaluated at sample times
+        idx = np.searchsorted(sp_t, t, side='right') - 1
+        idx = np.clip(idx, 0, len(sp_v) - 1)
+        sp_of_t = sp_v[idx]
+        err = temp_ema_c - sp_of_t
+        m = settled_pid_mask(t, events, t_end, settle_s) & np.isfinite(err)
+        if m.any():
+            pct = 100.0 * np.mean(np.abs(err[m]) <= band)
+            stats['pct_in_band'] = pct
+            stats['n_settled'] = int(m.sum())
+            pills.append(("{:.0f}%".format(pct),
+                          "settled time within\n\u00b1{:.1f} \u00b0C of target"
+                          .format(band)))
+
+    # --- fault handling ---
+    fwins = fault_windows(events)
+    n_raised = 0
+    if events is not None:
+        n_raised = int(np.sum(events['kind'] == EV_FAULT_RAISED))
+    if n_raised:
+        stats['n_faults'] = n_raised
+        stats['n_recovered'] = len(fwins)
+        pills.append(("{}/{}".format(len(fwins), n_raised),
+                      "faults detected\n& auto-recovered"))
+        if fwins:
+            rec = float(np.mean([t1 - t0 for (t0, t1, _) in fwins]))
+            stats['mean_recovery_s'] = rec
+            pills.append(("{:.0f} s".format(rec),
+                          "mean fault\nrecovery time"))
+
+    return pills, stats
+
+
+# =========================================================================
 # STYLE
 # =========================================================================
 def apply_style():
@@ -238,17 +342,48 @@ def apply_style():
 
 def draw_title(ax, main, subtitle, suffix=""):
     ax.axis('off')
-    ax.text(0.0, 0.85, main,
-            fontsize=22, fontweight='bold', color=C_INK,
+    ax.text(0.0, 0.88, main,
+            fontsize=21, fontweight='bold', color=C_INK,
             ha='left', va='top', transform=ax.transAxes)
     full_sub = subtitle + (" - " + suffix if suffix else "")
-    ax.text(0.0, 0.25, full_sub,
-            fontsize=10.5, color=C_INK_SOFT,
+    ax.text(0.0, 0.30, full_sub,
+            fontsize=10, color=C_INK_SOFT,
             ha='left', va='top', transform=ax.transAxes)
+
+
+def draw_kpi_pills(ax, pills):
+    """Up to 3 result pills, right-aligned in the title band.
+    These are the numbers a reader takes away in 5 seconds."""
+    if not pills:
+        return
+    pills = pills[:3]
+    n = len(pills)
+    w, gap = 0.115, 0.022
+    for i, (value, label) in enumerate(pills):
+        xc = 1.0 - (w / 2) - (n - 1 - i) * (w + gap)
+        box = FancyBboxPatch(
+            (xc - w / 2, 0.02), w, 0.96,
+            boxstyle="round,pad=0.008,rounding_size=0.025",
+            transform=ax.transAxes, clip_on=False,
+            facecolor=C_PILL_BG, edgecolor=C_PILL_ED, linewidth=0.9,
+            zorder=2)
+        ax.add_patch(box)
+        ax.text(xc, 0.70, value, fontsize=15.5, fontweight='bold',
+                color=C_INK, ha='center', va='center',
+                transform=ax.transAxes, zorder=3)
+        ax.text(xc, 0.26, label, fontsize=7.2, color=C_INK_SOFT,
+                ha='center', va='center', transform=ax.transAxes,
+                zorder=3, linespacing=1.25)
+
+
+def state_legend_patches():
+    return [Patch(facecolor=C_PID, alpha=0.35, label='PID active'),
+            Patch(facecolor=C_COOLING, alpha=0.45, label='Cooling'),
+            Patch(facecolor=C_FAULT, alpha=0.45, label='Fault')]
 
 
 # =========================================================================
-# STORY CALLOUTS (Figure 1) - short, anti-collision, arrow-anchored
+# STORY CALLOUTS (Figure 1)
 # =========================================================================
 def add_story_callouts(ax, t, temp_ema_c, events, t_end):
     """Short labels with arrows. Two-row staggering when events are close."""
@@ -262,7 +397,6 @@ def add_story_callouts(ax, t, temp_ema_c, events, t_end):
         return float(np.interp(time_val,
                                t[finite_mask], temp_ema_c[finite_mask]))
 
-    # Build short, recruiter-readable beats from state transitions only.
     beats, prev = [], None
     for e in events:
         if int(e['kind']) != EV_STATE_CHANGE:
@@ -278,10 +412,11 @@ def add_story_callouts(ax, t, temp_ema_c, events, t_end):
                         and abs(float(fe['time_s']) - te) < 2.0):
                     reason = FAULT_NAMES.get(int(fe['u8_payload']), '?')
                     break
-            lbl = "FAULT" if not reason else "FAULT\n({})".format(reason)
+            lbl = "FAULT" if not reason \
+                else "FAULT\n{}".format(fault_human(reason))
             beats.append((te, lbl, C_FAULT))
         elif sn == 'IDLE' and prev == 'FAULT':
-            beats.append((te, "RECOVER", C_PID))
+            beats.append((te, "RECOVERED", C_PID))
         elif sn == 'COOLING':
             beats.append((te, "STOP\n(cool first)", C_COOLING))
         elif sn == 'IDLE' and prev == 'COOLING':
@@ -291,7 +426,6 @@ def add_story_callouts(ax, t, temp_ema_c, events, t_end):
     if not beats:
         return
 
-    # Anti-collision: stagger Y when consecutive events are close in time.
     min_gap = t_end * 0.06
     placed, last_t, last_high = [], -1e9, False
     for (te, label, color) in beats:
@@ -302,10 +436,9 @@ def add_story_callouts(ax, t, temp_ema_c, events, t_end):
         last_t, last_high = te, y_high
 
     for (te, label, color, y_frac) in placed:
-        y_anchor = temp_near(te)
         ax.annotate(
             label,
-            xy=(te, y_anchor),
+            xy=(te, temp_near(te)),
             xytext=(te, y_frac),
             xycoords='data',
             textcoords=('data', 'axes fraction'),
@@ -330,11 +463,11 @@ def draw_fsm_diagram(ax, events):
     ax.set_xlim(0, 10); ax.set_ylim(0, 10)
     ax.set_aspect('equal'); ax.axis('off')
 
-    ax.text(5.0, 9.7, "FSM (per-zone)",
+    ax.text(5.0, 9.7, "State machine (per zone)",
             ha='center', va='top', fontsize=13, fontweight='bold',
             color=C_INK)
     ax.text(5.0, 9.15,
-            "counts from this run",
+            "transition counts measured in this run",
             ha='center', va='top', fontsize=8.5, color=C_INK_SOFT,
             style='italic')
 
@@ -363,15 +496,15 @@ def draw_fsm_diagram(ax, events):
         ax.text(x, y + 0.18, name, ha='center', va='center',
                 fontsize=12, fontweight='bold', color='white', zorder=4)
         if active:
-            ax.text(x, y - 0.24, "x{}".format(n_visits),
-                    ha='center', va='center', fontsize=8.5,
+            ax.text(x, y - 0.24, "entered x{}".format(n_visits),
+                    ha='center', va='center', fontsize=8,
                     color='white', zorder=4)
 
     edges = [
         ('IDLE',    'PID',     'start',   (5.0, 7.1), 0.0),
         ('PID',     'COOLING', 'stop',    (8.7, 4.4), 0.0),
-        ('COOLING', 'IDLE',    'cool',    (5.0, 3.1), -0.25),
-        ('PID',     'FAULT',   'trip',    (5.0, 5.1), 0.0),
+        ('COOLING', 'IDLE',    'cooled',  (5.0, 3.1), -0.25),
+        ('PID',     'FAULT',   'fault trip', (5.0, 5.1), 0.0),
         ('FAULT',   'IDLE',    'recover', (1.3, 4.4), 0.0),
     ]
     for src, dst, label, (lx, ly), rad in edges:
@@ -398,8 +531,7 @@ def draw_fsm_diagram(ax, events):
 
 
 def draw_fsm_reference(ax):
-    """Clean reference diagram. No counts. Figure 3 only.
-       Purpose: explain the FSM topology to a first-time reader, not the run."""
+    """Clean reference diagram, no counts. Figure 3 only."""
     ax.set_xlim(0, 10); ax.set_ylim(0, 10)
     ax.set_aspect('equal'); ax.axis('off')
 
@@ -426,7 +558,7 @@ def draw_fsm_reference(ax):
     edges = [
         ('IDLE',    'PID',     'start',   0.0),
         ('PID',     'COOLING', 'stop',    0.0),
-        ('COOLING', 'IDLE',    'cool',   -0.25),
+        ('COOLING', 'IDLE',    'cooled', -0.25),
         ('PID',     'FAULT',   'trip',    0.0),
         ('FAULT',   'IDLE',    'recover', 0.0),
     ]
@@ -439,7 +571,6 @@ def draw_fsm_reference(ax):
             color=C_INK_SOFT, linewidth=1.1,
             shrinkA=24, shrinkB=24, zorder=2)
         ax.add_patch(arrow)
-        # Position label at the midpoint
         if rad == 0:
             lx, ly = (x0 + x1) / 2, (y0 + y1) / 2
         else:
@@ -454,8 +585,7 @@ def draw_fsm_reference(ax):
 
 
 def draw_mini_fsm(ax, active_from, active_to):
-    """Tiny FSM for walkthrough insets. Active state bright, others faded.
-       Only the transition arrow that fired is drawn."""
+    """Tiny FSM for walkthrough insets."""
     ax.set_xlim(0, 10); ax.set_ylim(0, 10)
     ax.set_aspect('equal'); ax.axis('off')
 
@@ -517,28 +647,26 @@ def draw_zoom_panel(ax, t, temp_raw, temp_ema, vnode,
 
     if temp_raw is not None:
         ax.plot(t_local, temp_raw[m], lw=0.9, color=C_TEMP_RAW,
-                label='temp (raw)', alpha=0.7)
+                label=LBL['temp_raw'], alpha=0.7)
     if temp_ema is not None:
         ax.plot(t_local, temp_ema[m], lw=1.6, color=C_TEMP_EMA,
-                label='temp_ema')
+                label='Filtered temp')
     if vnode is not None:
         ax2.plot(t_local, vnode[m], lw=1.0, color=C_VNODE,
-                 linestyle='--', label='vnode')
+                 linestyle='--', label=LBL['vnode'])
         ax2.set_ylim(-0.1, 3.5)
         ax2.axhline(2.5, color=C_FAULT, lw=0.4, ls=':')
         ax2.axhline(0.02, color=C_FAULT, lw=0.4, ls=':')
-        ax2.set_ylabel("vnode (V)", color=C_VNODE, fontsize=9, labelpad=6)
+        ax2.set_ylabel("Sensor (V)", color=C_VNODE, fontsize=9, labelpad=6)
         ax2.tick_params(axis='y', labelcolor=C_VNODE, labelsize=8)
 
     ax.axvspan(t_trip, t_clear, color=C_FAULT, alpha=0.15, zorder=0)
     ax.axvline(t_trip, color=C_FAULT, lw=1.2)
     ax.axvline(t_clear, color=C_PID, lw=1.2, ls='-.')
 
-    trigger = {'NTC_OPEN': 'NTC unplugged',
-               'NTC_SHORT': 'NTC shorted'}.get(reason_name, reason_name)
     _, ymax = ax.get_ylim()
     ax.annotate(
-        "TRIP\n{}".format(trigger),
+        "FAULT TRIP\n{}".format(fault_human(reason_name)),
         xy=(t_trip, ymax * 0.95),
         xytext=(t_trip - margin * 0.5, ymax * 0.80),
         fontsize=8, color=C_FAULT, fontweight='bold',
@@ -547,7 +675,7 @@ def draw_zoom_panel(ax, t, temp_raw, temp_ema, vnode,
                   ec=C_FAULT, lw=0.7),
         arrowprops=dict(arrowstyle='->', color=C_FAULT, lw=0.7))
     ax.annotate(
-        "Recover",
+        "Auto-recover",
         xy=(t_clear, ymax * 0.55),
         xytext=(t_clear + margin * 0.18, ymax * 0.65),
         fontsize=8, color=C_PID, fontweight='bold',
@@ -558,12 +686,11 @@ def draw_zoom_panel(ax, t, temp_raw, temp_ema, vnode,
 
     duration = t_clear - t_trip
     ax.set_title(
-        "Detail [{}]   t = {:.0f}s   duration = {:.0f}s".format(
+        "Fault event {}   trip at t = {:.0f} s   resolved in {:.0f} s".format(
             idx, t_trip, duration),
         fontsize=10, fontweight='bold', color=C_INK, loc='left')
 
-    # The crucial left-axis label - make it big and padded so it can't be cropped
-    ax.set_ylabel("Temperature (°C)",
+    ax.set_ylabel("Temperature (\u00b0C)",
                   fontsize=10, color=C_TEMP_EMA, labelpad=8)
     ax.set_xlabel("Time (s)", fontsize=9, color=C_INK_SOFT)
     ax.tick_params(axis='both', labelsize=8)
@@ -571,7 +698,6 @@ def draw_zoom_panel(ax, t, temp_raw, temp_ema, vnode,
     ax.grid(True, alpha=0.3)
     ax.set_xlim(t_lo, t_hi)
 
-    # Combined twinx legend
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     if lines1 or lines2:
@@ -634,10 +760,8 @@ def select_walkthrough_pivots(events, max_insets=8):
 # =========================================================================
 # FIGURE 1 - OVERVIEW
 # =========================================================================
-def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
-    """Title + temperature + duty. No KPI banner. No state strip.
-       Y-axis is computed from real data (percentile-based), not the
-       garbage temperatures recorded during a fault."""
+def make_overview_plot(data, fields, events, png_path, show,
+                       title_suffix="", band=0.5, settle_s=180.0):
     apply_style()
 
     t = col(data, fields, "time_s")
@@ -654,21 +778,24 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
 
     sp_t, sp_v = setpoint_steps(events, t_end)
     intervals = state_intervals(events, t_end)
+    kpi_pills, kpi_stats = compute_kpis(t, temp_ema_c, events, t_end,
+                                        band, settle_s)
 
-    fig = plt.figure(figsize=(13, 6.5), facecolor=C_BG)
+    fig = plt.figure(figsize=(FIG_W, 6.8), facecolor=C_BG)
     gs = fig.add_gridspec(
-        3, 1, height_ratios=[0.6, 3.6, 1.4],
-        hspace=0.30, left=0.07, right=0.97, top=0.93, bottom=0.09)
+        3, 1, height_ratios=[0.75, 3.6, 1.4],
+        hspace=0.30, left=0.06, right=0.97, top=0.94, bottom=0.09)
 
     ax_title = fig.add_subplot(gs[0])
     ax_temp  = fig.add_subplot(gs[1])
     ax_duty  = fig.add_subplot(gs[2], sharex=ax_temp)
 
     draw_title(ax_title, "STM32 Thermal Controller",
-               "Closed-loop PI control with state-machine safety, verified on hardware",
-               title_suffix)
+               "Closed-loop PI control with state-machine safety,\n"
+               "verified on real hardware", title_suffix)
+    draw_kpi_pills(ax_title, kpi_pills)
 
-    # Subtle state shading on temperature panel
+    # State shading (explained in the legend below)
     for (t0, t1, st) in intervals:
         if st == 1:
             ax_temp.axvspan(t0, t1, color=C_PID, alpha=0.05, zorder=0)
@@ -677,22 +804,35 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
         elif st == 2:
             ax_temp.axvspan(t0, t1, color=C_COOLING, alpha=0.07, zorder=0)
 
+    # Target band: makes the +/-band claim visible at a glance
+    if sp_t is not None:
+        ax_temp.fill_between(sp_t, sp_v - band, sp_v + band,
+                             step='post', color=C_BAND, alpha=0.18,
+                             zorder=1,
+                             label='{} (\u00b1{:.1f} \u00b0C)'.format(
+                                 LBL['band'], band))
+
     if temp_raw_c is not None:
         ax_temp.plot(t, temp_raw_c, lw=0.8, color=C_TEMP_RAW,
-                     label='temp_c (raw)', zorder=2)
+                     label=LBL['temp_raw'], zorder=2)
     if temp_ema_c is not None:
         ax_temp.plot(t, temp_ema_c, lw=2.0, color=C_TEMP_EMA,
-                     label='temp_ema (PID input)', zorder=3)
+                     label=LBL['temp_ema'], zorder=3)
     if sp_t is not None:
         ax_temp.step(sp_t, sp_v, where='post', lw=1.4,
                      color=C_SETPOINT, linestyle='--',
-                     label='setpoint', alpha=0.9, zorder=4)
+                     label=LBL['setpoint'], alpha=0.9, zorder=4)
 
-    ax_temp.set_ylabel("Temperature (°C)", color=C_INK)
+    ax_temp.set_ylabel("Temperature (\u00b0C)", color=C_INK)
     ax_temp.grid(True, axis='y')
-    ax_temp.legend(loc='lower right', ncol=3, bbox_to_anchor=(1.0, 1.005))
 
-    # ---- Y-axis: percentile-based, ignoring outliers and including setpoints ----
+    handles, labels = ax_temp.get_legend_handles_labels()
+    handles += state_legend_patches()
+    labels += [h.get_label() for h in state_legend_patches()]
+    ax_temp.legend(handles, labels, loc='lower right',
+                   ncol=3, fontsize=8, bbox_to_anchor=(1.0, 1.005))
+
+    # Y-limits: percentile-based, immune to fault-window garbage
     finite_vals = []
     for arr in (temp_raw_c, temp_ema_c):
         if arr is not None:
@@ -704,26 +844,31 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
         ymin = float(np.nanpercentile(all_t, 1))
         ymax = float(np.nanpercentile(all_t, 99))
         if sp_v is not None and len(sp_v):
-            ymin = min(ymin, float(np.min(sp_v)))
-            ymax = max(ymax, float(np.max(sp_v)))
+            ymin = min(ymin, float(np.min(sp_v)) - band)
+            ymax = max(ymax, float(np.max(sp_v)) + band)
         span = max(ymax - ymin, 1.0)
-        # Modest top headroom for callouts (no more 140°C ceiling)
         ax_temp.set_ylim(ymin - 0.10 * span, ymax + 0.30 * span)
 
     add_story_callouts(ax_temp, t, temp_ema_c, events, t_end)
 
-    # ---- Duty panel ----
+    # ---- Actuator panel (percent, signed: heater up / fan down) ----
     if duty is not None:
-        ax_duty.fill_between(t, 0, duty, where=(duty > 0),
-                             color=C_HEATER, alpha=0.6, label='heater')
-        ax_duty.fill_between(t, 0, duty, where=(duty < 0),
-                             color=C_FAN, alpha=0.6, label='fan')
-        ax_duty.plot(t, duty, lw=0.7, color=C_INK)
+        duty_pct = 100.0 * duty
+        ax_duty.fill_between(t, 0, duty_pct, where=(duty_pct > 0),
+                             color=C_HEATER, alpha=0.6, label=LBL['heater'])
+        ax_duty.fill_between(t, 0, duty_pct, where=(duty_pct < 0),
+                             color=C_FAN, alpha=0.6, label=LBL['fan'])
+        ax_duty.plot(t, duty_pct, lw=0.7, color=C_INK)
         ax_duty.axhline(0, color=C_INK, lw=0.5)
-    ax_duty.set_ylim(-1.1, 1.1)
-    ax_duty.set_ylabel("Duty [-1..+1]", color=C_INK)
+    ax_duty.set_ylim(-110, 110)
+    ax_duty.set_yticks([-100, -50, 0, 50, 100])
+    ax_duty.set_ylabel(LBL['duty_ax'], color=C_INK)
     ax_duty.grid(True, axis='y')
-    ax_duty.legend(loc='upper right', ncol=2, bbox_to_anchor=(1.0, 1.18))
+    ax_duty.legend(loc='upper right', ncol=2, fontsize=8,
+                   bbox_to_anchor=(1.0, 1.22))
+    ax_duty.text(0.005, 0.93, "one signed PID output: heater (+) / fan (\u2212)",
+                 transform=ax_duty.transAxes, fontsize=7.5,
+                 color=C_INK_SOFT, style='italic', va='top')
     ax_duty.set_xlabel(
         "Time (s)   /   total run: {}:{:02d}".format(
             int(t_end) // 60, int(t_end) % 60),
@@ -731,11 +876,12 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
 
     plt.setp(ax_temp.get_xticklabels(), visible=False)
 
-    fig.savefig(png_path, dpi=160, bbox_inches='tight', facecolor=C_BG)
+    fig.savefig(png_path, dpi=DPI, bbox_inches='tight', facecolor=C_BG)
     print("[png] wrote {}".format(png_path), file=sys.stderr)
     if show:
         plt.show()
     plt.close(fig)
+    return kpi_stats
 
 
 # =========================================================================
@@ -757,14 +903,15 @@ def make_detail_plot(data, fields, events, png_path, show, title_suffix=""):
     fault_wins = fault_windows(events)
     n_zooms = min(3, len(fault_wins))
 
-    fig = plt.figure(figsize=(14, 6.5), facecolor=C_BG)
+    fig = plt.figure(figsize=(FIG_W, 6.5), facecolor=C_BG)
     gs = fig.add_gridspec(
-        2, 1, height_ratios=[0.45, 4.0], hspace=0.28,
+        2, 1, height_ratios=[0.50, 4.0], hspace=0.28,
         left=0.06, right=0.98, top=0.94, bottom=0.07)
 
     ax_title = fig.add_subplot(gs[0])
-    draw_title(ax_title, "STM32 Thermal Controller - Detail",
-               "FSM with live counts (left)   /   per-fault zoom panels (right)",
+    draw_title(ax_title, "Fault Handling - Detail",
+               "State machine with measured transition counts (left)  /  "
+               "zoom on each injected fault (right)",
                title_suffix)
 
     if n_zooms == 0:
@@ -786,7 +933,7 @@ def make_detail_plot(data, fields, events, png_path, show, title_suffix=""):
                  "Showing first 3 of {} fault events".format(len(fault_wins)),
                  fontsize=8, color=C_INK_SOFT, ha='right')
 
-    fig.savefig(png_path, dpi=160, bbox_inches='tight', facecolor=C_BG)
+    fig.savefig(png_path, dpi=DPI, bbox_inches='tight', facecolor=C_BG)
     print("[png] wrote {}".format(png_path), file=sys.stderr)
     if show:
         plt.show()
@@ -796,7 +943,8 @@ def make_detail_plot(data, fields, events, png_path, show, title_suffix=""):
 # =========================================================================
 # FIGURE 3 - WALKTHROUGH
 # =========================================================================
-def make_walkthrough_plot(data, fields, events, png_path, show, title_suffix=""):
+def make_walkthrough_plot(data, fields, events, png_path, show,
+                          title_suffix=""):
     apply_style()
 
     t = col(data, fields, "time_s")
@@ -812,26 +960,26 @@ def make_walkthrough_plot(data, fields, events, png_path, show, title_suffix="")
         print("[walkthrough] no events, skipping", file=sys.stderr)
         return
 
-    fig = plt.figure(figsize=(15, 5.8), facecolor=C_BG)
+    fig = plt.figure(figsize=(FIG_W, 5.8), facecolor=C_BG)
     gs = fig.add_gridspec(
         4, 1, height_ratios=[1.8, 2.0, 0.85, 0.65],
         hspace=0.22, left=0.04, right=0.98, top=0.97, bottom=0.10)
 
-    # Top row: title (left) + clean FSM reference (right)
     gs_top = gs[0].subgridspec(1, 2, width_ratios=[1.6, 1.0], wspace=0.05)
     ax_title = fig.add_subplot(gs_top[0]); ax_title.axis('off')
     ax_ref   = fig.add_subplot(gs_top[1])
 
     ax_title.text(0.0, 0.85, "FSM Walkthrough",
-                  fontsize=22, fontweight='bold', color=C_INK,
+                  fontsize=21, fontweight='bold', color=C_INK,
                   ha='left', va='top', transform=ax_title.transAxes)
     ax_title.text(0.0, 0.55,
-                  "What the controller actually did, step by step"
+                  "Every state transition observed in this run, in order"
                   + (" - " + title_suffix if title_suffix else ""),
-                  fontsize=10.5, color=C_INK_SOFT,
+                  fontsize=10, color=C_INK_SOFT,
                   ha='left', va='top', transform=ax_title.transAxes)
-    ax_title.text(0.0, 0.20,
-                  "Reference key on the right.",
+    ax_title.text(0.0, 0.22,
+                  "Read left to right; arrows anchor each step to the "
+                  "timeline below. Colors match the state diagram (right).",
                   fontsize=9, color=C_INK_SOFT, style='italic',
                   ha='left', va='top', transform=ax_title.transAxes)
 
@@ -839,7 +987,6 @@ def make_walkthrough_plot(data, fields, events, png_path, show, title_suffix="")
 
     # Inset row
     gs_insets = gs[1].subgridspec(1, n, wspace=0.20)
-    inset_axes = []
     for i, p in enumerate(pivots):
         ax_i = fig.add_subplot(gs_insets[i])
         if p['kind'] == 'state':
@@ -847,14 +994,13 @@ def make_walkthrough_plot(data, fields, events, png_path, show, title_suffix="")
         else:
             draw_mini_fsm(ax_i, None, None)
             ax_i.text(5.0, 5.0,
-                      "SP\n{:.0f} C".format(p['value']),
+                      "Target\n{:.0f} \u00b0C".format(p['value']),
                       ha='center', va='center',
                       fontsize=10, fontweight='bold', color=C_SETPOINT,
                       bbox=dict(boxstyle='round,pad=0.3',
                                 fc='white', ec=C_SETPOINT, lw=1.0))
-        inset_axes.append(ax_i)
 
-    # Caption block
+    # Caption row
     gs_caps = gs[2].subgridspec(1, n, wspace=0.20)
     caption_axes = []
     for i, p in enumerate(pivots):
@@ -867,20 +1013,21 @@ def make_walkthrough_plot(data, fields, events, png_path, show, title_suffix="")
                   fontweight='bold', color=C_INK,
                   transform=ax_c.transAxes)
         if p['kind'] == 'state':
-            arrow_str = "{} -> {}".format(p['from'] or 'boot', p['to'])
+            arrow_str = "{} \u2192 {}".format(p['from'] or 'boot', p['to'])
             ax_c.text(0.5, 0.62, arrow_str,
                       ha='center', va='top', fontsize=8.5,
                       color=C_INK_SOFT, transform=ax_c.transAxes)
             if p['reason']:
-                ax_c.text(0.5, 0.30, "FR_{}".format(p['reason']),
-                          ha='center', va='top', fontsize=8,
+                ax_c.text(0.5, 0.30,
+                          "cause: {}".format(fault_human(p['reason'])),
+                          ha='center', va='top', fontsize=7.5,
                           color=C_FAULT, fontweight='bold',
                           transform=ax_c.transAxes)
         else:
             ax_c.text(0.5, 0.62, "Setpoint change",
                       ha='center', va='top', fontsize=8.5,
                       color=C_INK_SOFT, transform=ax_c.transAxes)
-            ax_c.text(0.5, 0.30, "-> {:.0f} C".format(p['value']),
+            ax_c.text(0.5, 0.30, "\u2192 {:.0f} \u00b0C".format(p['value']),
                       ha='center', va='top', fontsize=8,
                       color=C_SETPOINT, fontweight='bold',
                       transform=ax_c.transAxes)
@@ -926,7 +1073,7 @@ def make_walkthrough_plot(data, fields, events, png_path, show, title_suffix="")
             shrinkA=2, shrinkB=2, zorder=10)
         fig.patches.append(arrow)
 
-    fig.savefig(png_path, dpi=160, bbox_inches='tight', facecolor=C_BG)
+    fig.savefig(png_path, dpi=DPI, bbox_inches='tight', facecolor=C_BG)
     print("[png] wrote {}".format(png_path), file=sys.stderr)
     if show:
         plt.show()
@@ -986,6 +1133,24 @@ def print_fingerprint(data, fields, events):
     print("=" * 72)
 
 
+def print_kpis(stats, band, settle_s):
+    if not stats:
+        return
+    print("\n  HEADLINE KPIs (as shown on Figure 1)")
+    print("  " + "-" * 50)
+    if 'pct_in_band' in stats:
+        print("  tracking : {:.1f}% of settled PID time within "
+              "+/-{:.1f} C  ({} samples, {:.0f}s settling excluded "
+              "after each step)".format(
+                  stats['pct_in_band'], band,
+                  stats['n_settled'], settle_s))
+    if 'n_faults' in stats:
+        print("  faults   : {}/{} detected & auto-recovered".format(
+            stats.get('n_recovered', 0), stats['n_faults']))
+    if 'mean_recovery_s' in stats:
+        print("  recovery : {:.1f} s mean".format(stats['mean_recovery_s']))
+
+
 # =========================================================================
 # CSV + MAIN
 # =========================================================================
@@ -1001,6 +1166,11 @@ def main():
     ap.add_argument("--events", help="Expressions-view dump for thermal_events[]")
     ap.add_argument("-o", "--csv", help="write dense data to this CSV")
     ap.add_argument("--title", default="")
+    ap.add_argument("--band", type=float, default=0.5,
+                    help="tracking band in degC for the KPI (default 0.5)")
+    ap.add_argument("--settle", type=float, default=180.0,
+                    help="seconds excluded after each setpoint step / PID "
+                         "entry before tracking KPI counts (default 180)")
     ap.add_argument("--no-plot", action="store_true")
     args = ap.parse_args()
 
@@ -1026,8 +1196,11 @@ def main():
         save_csv(args.csv, data, fields)
 
     stem = (args.csv or args.infile).rsplit(".", 1)[0]
-    make_overview_plot(data, fields, events, stem + "_overview.png",
-                       show=not args.no_plot, title_suffix=args.title)
+    kpi_stats = make_overview_plot(
+        data, fields, events, stem + "_overview.png",
+        show=not args.no_plot, title_suffix=args.title,
+        band=args.band, settle_s=args.settle)
+    print_kpis(kpi_stats, args.band, args.settle)
     make_detail_plot(data, fields, events, stem + "_detail.png",
                      show=not args.no_plot, title_suffix=args.title)
     make_walkthrough_plot(data, fields, events, stem + "_walkthrough.png",

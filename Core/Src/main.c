@@ -32,6 +32,7 @@
 #include "ssd1306.h"
 #include "ring_buf.h"
 #include "thermal_app.h"
+#include "cyc.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,7 +61,7 @@ TIM_HandleTypeDef htim3;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-/* (nothing required here for the thermal logger – all state is in thermal_app.c) */
+extern volatile Profiler g_prof;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -497,7 +498,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         // Push event.
         // Note: In a real critical system, we might check the return value
         // and log if the queue is full, but for now we assume it fits.
-        RingBuffer_Push(EVT_PID_TICK);
+    	g_prof.tick_stamp = DWT->CYCCNT;
+    	RingBuffer_Push(EVT_PID_TICK);
 
         // Optional: Toggle an LED here to visually verify the interrupt is firing
         // HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
