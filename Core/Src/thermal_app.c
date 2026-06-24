@@ -53,7 +53,7 @@ uint32_t thermal_log_magic;
 extern ADC_HandleTypeDef hadc1;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
-
+extern I2C_HandleTypeDef hi2c1;
 /* ============================================================================
  * PUBLIC GLOBALS
  * ========================================================================== */
@@ -434,6 +434,11 @@ void ThermalApp_Init(void)
 
     /* 1. Drain event queue before any ISR can push to it */
     RingBuffer_Init();
+    /* ── SPSC boot self-test (TEMPORARY - delete after one green run) ──
+     * Must run BEFORE HAL_TIM_Base_Start_IT(&htim2) at the bottom of this
+     * function: the queue must have no other producer while we test it.
+     * rb_test_result == 0 means every property holds. Each bit = one
+     * specific broken property.                                          */
 
     /* 2. Start PWM channels at 0 % (safe state) */
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
@@ -484,7 +489,16 @@ void ThermalApp_Loop(void)
 {
     Event_t current_event;
     g_prof.loop_count++;
-
+    /* ── FAKE HUNG NODE (Phase 0 experiment - TEMPORARY) ──────────────────
+     * Simulates polling a dead ATmega32 zone node: address 0x42, nobody
+     * home. HAL retries until the 100 ms timeout expires. This is what a
+     * crashed slave does to a super-loop.                                 */
+    {
+        uint8_t dummy;
+        uint32_t tn0 = DWT->CYCCNT;
+        HAL_I2C_Master_Receive(&hi2c1, (0x42 << 1), &dummy, 1, 100);
+        g_prof.node_us = CYC_TO_US(DWT->CYCCNT - tn0);
+    }
     /* --- STEP 1: SENSING (every loop iteration, regardless of events) --- */
     uint32_t t0 = DWT->CYCCNT;
     uint32_t adc_avg = adc_average(THERM_ADC_OVERSAMPLE);

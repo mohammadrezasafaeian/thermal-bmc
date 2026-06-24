@@ -2,16 +2,17 @@
 #include <stddef.h>
 
 /* ============================================================================
- * SPSC ring buffer (Single Producer = TIM2 ISR, Single Consumer = main loop)
+ * SPSC ring buffer — Single Producer (TIM2 ISR), Single Consumer (main loop)
  *
- * OWNERSHIP CONTRACT (this is the whole trick — fill in TODO 1):
- *   head : written ONLY by the main file , read by both
- *   tail : written ONLY by ISR, read by both
- *   Because each index has exactly one writer, no disable-IRQ, no locks.
+ * OWNERSHIP CONTRACT:
+ *   head : written ONLY by the ISR  (Push side),  read by both
+ *   tail : written ONLY by main loop (Pop side),  read by both
+ *   One writer per index + naturally-atomic byte stores on Cortex-M
+ *   => no disable-IRQ, no locks needed.
  * ========================================================================== */
 
-#define RB_SIZE 16              /* must be a power of 2 — see TODO 4 */
-#define RB_MASK (RB_SIZE - 1)
+#define RB_SIZE 16              /* power of 2: makes (x & RB_MASK) == (x % RB_SIZE) */
+#define RB_MASK (RB_SIZE - 1)   /* 0b1111 — all-ones mask, 1-cycle AND vs costly %  */
 
 typedef struct {
     Event_t buffer[RB_SIZE];
@@ -30,47 +31,40 @@ bool RingBuffer_IsEmpty(void)
 
 bool RingBuffer_IsFull(void)
 {
-    /* TODO 2: write the full-detection condition.
-     * Constraint you must respect: with this scheme, the buffer can hold at
-     * most RB_SIZE-1 events, NOT RB_SIZE. In a comment, answer: WHY do we
-     * sacrifice one slot? What would go wrong if we allowed all 16 to fill?
-     * we keep one slot for differentiating between full and empty
-     * (Hint location, not answer: look at IsEmpty's condition.)            */
-	if (q.head == q.tail-1)
-		return true
-		else:
-		return false
-
-
+    /* Full = the slot AFTER head is where tail stands. Mask applied to the
+     * successor, so the wrap (head=15 -> 0) is handled.
+     * One slot stays sacrificed: if all 16 could fill, head==tail would be
+     * both "empty" and "full" — ambiguous. Capacity is RB_SIZE-1 = 15.    */
+    return (((q.head + 1) & RB_MASK) == q.tail);
 }
 
-bool RingBuffer_Push(Event_t evt)       /* called from ISR context only */
+bool RingBuffer_Push(Event_t evt)       /* ISR context only */
 {
-    if (RingBuffer_IsFull()) return false;   /* drop, never overwrite    */
+    if (RingBuffer_IsFull()) return false;   /* drop, never overwrite */
 
-    /* TODO 3a: two lines — (i) store evt into the buffer, (ii) advance head.
-     * THE ORDER OF THESE TWO LINES IS THE EXAM. In a comment, answer:
-     * if you advanced head FIRST and stored the data SECOND, what exact
-     * sequence of events corrupts the consumer? Walk it: ISR does step (ii),
-     * then... what can happen before step (i)?                            */
-    q.buffer[q.head++] = evt;
+    /* ORDER MATTERS: data first, index second.
+     * head is the consumer's "data ready" signal. If we advanced head first,
+     * the main loop could run between the two lines (the ISR can't be
+     * interrupted by main, but the main loop resumes the instant we return —
+     * and with nested/multiple IRQs the gap is real), see the new head,
+     * and Pop a slot whose data was never stored: a stale/garbage event.
+     * Publishing the index LAST means the slot is complete before it is
+     * visible.                                                            */
+    q.buffer[q.head] = evt;
+    q.head = (q.head + 1) & RB_MASK;
     return true;
 }
 
-bool RingBuffer_Pop(Event_t *out)       /* called from main loop only */
+bool RingBuffer_Pop(Event_t *out)       /* main loop only */
 {
     if (out == NULL) return false;
     if (RingBuffer_IsEmpty()) return false;
 
-    /* TODO 3b: two lines — (i) copy buffer[tail] to *out, (ii) advance tail.
-     * Same ordering discipline, mirrored. One-line comment: why is THIS
-     * order the safe one on the consumer side?                            */
-    &out = q.buffer[q.tail++]
+    /* Mirror discipline: copy first, release the slot second.
+     * tail is the producer's "slot free" signal. If we advanced tail first,
+     * the ISR could fire between the two lines, see the freed slot, and
+     * OVERWRITE buffer[old tail] while we are still copying from it.      */
+    *out = q.buffer[q.tail];
+    q.tail = (q.tail + 1) & RB_MASK;
     return true;
 }
-
-/* TODO 4 (comment only, 2 sentences): the index advance is
- *      idx = (idx + 1) & RB_MASK;
- * Why must RB_SIZE be a power of 2 for this to work — and what does this
- * buy over the alternative  idx = (idx + 1) % RB_SIZE  on a Cortex-M4?
- * (One of the two answers is about correctness, the other about cost.)    */
