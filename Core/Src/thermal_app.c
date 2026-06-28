@@ -43,12 +43,12 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
-
+#include "semphr.h"
 /* ============================================================================
  * RTOS OBJECTS + FORWARD DECLARATIONS
  * ========================================================================== */
 static QueueHandle_t xCtrlQueue;            /* ISR -> ControlTask mailbox     */
-
+static SemaphoreHandle_t xAdcMutex;
 static void ControlTask(void const *argument);
 static void UITask(void const *argument);
 static void emit_change_events(ZoneCtrl *z);
@@ -117,17 +117,21 @@ static float   pid_temp         = 0.0f;  /* control-path EMA, feeds PID        *
  * ========================================================================== */
 static uint32_t adc_average(uint8_t n)
 {
+    BaseType_t locked = (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED);
+    if (locked) xSemaphoreTake(xAdcMutex, portMAX_DELAY);
+
     uint32_t sum = 0;
     for (uint8_t i = 0; i < n; i++) {
         HAL_ADC_Start(&hadc1);
-        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
             sum += HAL_ADC_GetValue(&hadc1);
-        }
         HAL_ADC_Stop(&hadc1);
     }
-    return sum / n;
-}
 
+    uint32_t result = sum / n;
+    if (locked) xSemaphoreGive(xAdcMutex);
+    return result;
+}
 static float adc_to_rntc(uint32_t adc_val)
 {
     float v = THERM_ADC_VREF * ((float)adc_val / 4095.0f);
@@ -541,7 +545,6 @@ void ThermalApp_TickISR(void)
 void ThermalApp_Init(void)
 {
     cyc_init();                              /* DWT cycle counter first        */
-
     /* PWM channels at 0% (safe state) */
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
@@ -586,9 +589,8 @@ void ThermalApp_Init(void)
 void ThermalApp_StartTasks(void)
 {
     xCtrlQueue = xQueueCreate(8, sizeof(Event_t));
-
+    xAdcMutex  = xSemaphoreCreateMutex();          // ← ADD here
     xTaskCreate(ControlTask, "Ctrl", 512, NULL, 3, NULL);
     xTaskCreate(UITask,      "UI",   512, NULL, 1, NULL);
-
-    HAL_TIM_Base_Start_IT(&htim2);           /* LAST: queue now exists         */
+    HAL_TIM_Base_Start_IT(&htim2);
 }
