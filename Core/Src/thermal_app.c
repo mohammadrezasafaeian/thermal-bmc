@@ -62,6 +62,7 @@ uint32_t thermal_log_magic;
 extern ADC_HandleTypeDef hadc1;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
+extern TIM_HandleTypeDef htim5;
 extern I2C_HandleTypeDef hi2c1;
 
 /* ============================================================================
@@ -167,14 +168,17 @@ static void pwm_update(void)
     if (cmd < -1.0f) cmd = -1.0f;
     if (cmd >  1.0f) cmd =  1.0f;
 
-    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim3);
-
     float heater_duty, fan_duty;
     if (cmd >= 0.0f) { heater_duty = cmd;  fan_duty = 0.0f; }
     else             { heater_duty = 0.0f; fan_duty = -cmd; }
 
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)(heater_duty * (float)arr));
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)(fan_duty    * (float)arr));
+    /* Heater on TIM3 CH1 @ 1 kHz */
+    uint32_t arr3 = __HAL_TIM_GET_AUTORELOAD(&htim3);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)(heater_duty * (float)arr3));
+
+    /* Fan on TIM5 CH2 @ 24 kHz */
+    uint32_t arr5 = __HAL_TIM_GET_AUTORELOAD(&htim5);
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, (uint32_t)(fan_duty * (float)arr5));
 
     g_fan_duty = fan_duty;
 }
@@ -548,8 +552,8 @@ void ThermalApp_Init(void)
     /* PWM channels at 0% (safe state) */
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+    HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2);
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, 0);
 
     /* Display buffer is not persistent - always clear */
     memset(plot_buf, 0, sizeof(plot_buf));
