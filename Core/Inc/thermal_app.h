@@ -1,6 +1,6 @@
 /* ==========================================================================
- * thermal_app.h  --  Thermal Logger with per-zone FSM + PID
- * Target : STM32F411CEU6 @ 100 MHz  (STM32CubeIDE + HAL)
+ * thermal_app.h  --  Dual-zone thermal controller (FreeRTOS)
+ * Target : STM32F411CEU6 @ 24 MHz  (HSI/PLL, verified via TIM2 cross-check)
  * ========================================================================== */
 #ifndef INC_THERMAL_APP_H_
 #define INC_THERMAL_APP_H_
@@ -28,7 +28,7 @@
 #define THERM_ADC_OVERSAMPLE  128
 #define THERM_LOG_LEN         2048
 #define THERM_PLOT_LEN        128
-#define THERM_OLED_DIVIDER    1
+#define THERM_OLED_DIVIDER    1         /* legacy; UITask now paces via vTaskDelay */
 
 /* Plot auto-scaling */
 #define THERM_PLOT_K          3.0f      /* half-span = K * ema_dev            */
@@ -67,52 +67,40 @@
 /* ============================================================================
  * STATE MACHINE - TYPES
  * ========================================================================== */
-
-/* ---- States: WHAT the zone is doing right now ---------------------------- */
 typedef enum {
     ST_IDLE    = 0,   /* actuators off, sensors live, waiting for start_req   */
-    ST_PID     = 1,   /* normal closed-loop control                            */
-    ST_COOLING = 2,   /* graceful shutdown: fan forced on until cool & sane    */
-    ST_FAULT   = 3    /* sensor lying or hardware fault; safe-park             */
+    ST_PID     = 1,   /* normal closed-loop control                          */
+    ST_COOLING = 2,   /* graceful shutdown: fan forced on until cool & sane   */
+    ST_FAULT   = 3    /* sensor lying or hardware fault; safe-park            */
 } ThermalState;
 
-/* ---- Fault reasons: WHY we tripped --------------------------------------- *
- *   FR_NONE         : healthy
- *   FR_NTC_OPEN     : V_node hugs ADC top rail -> NTC disconnected
- *   FR_NTC_SHORT    : V_node ~ 0 V             -> NTC shorted (LIES "hot")
- *   FR_HEATER_OPEN  : Topic 11 hook - needs current shunt
- *   FR_FAN_OPEN     : Topic 11 hook
- *   FR_ALL_DISCONNECTED : composite (deferred)                              */
 typedef enum {
     FR_NONE             = 0,
-    FR_NTC_OPEN         = 1,
-    FR_NTC_SHORT        = 2,
-    FR_HEATER_OPEN      = 3,
-    FR_FAN_OPEN         = 4,
+    FR_NTC_OPEN         = 1,   /* V_node hugs top rail  -> NTC disconnected   */
+    FR_NTC_SHORT        = 2,   /* V_node ~ 0 V          -> NTC shorted        */
+    FR_HEATER_OPEN      = 3,   /* Topic 11 hook - needs current shunt         */
+    FR_FAN_OPEN         = 4,   /* Topic 11 hook                               */
     FR_ALL_DISCONNECTED = 5
 } FaultReason;
 
 /* ============================================================================
- * VOLTAGE-BASED FAULT THRESHOLDS  (derived in EX-1)
+ * VOLTAGE-BASED FAULT THRESHOLDS
  *   Normal V_node = 75..147 mV (hugs GND, far from 3.3 V rail).
  *   OPEN  : ~3.3 V (clamp). Detection margin huge.
- *   SHORT : ~0 V. Detection margin TIGHT (~93 LSB on 12-bit; ~15 on AVR 10-bit
- *           - landmine for the future AVR port).
+ *   SHORT : ~0 V. Detection margin TIGHT.
  * ========================================================================== */
 #define V_OPEN_THRESH         2.5f      /* > this  -> NTC open                */
-#define V_SHORT_THRESH        0.05f   /* < this  -> NTC short               */
+#define V_SHORT_THRESH        0.05f     /* < this  -> NTC short               */
 
 /* ============================================================================
  * FAULT DEBOUNCE  (time-domain Schmitt; integer count on RAW signal, not EMA)
- *   M >> N by design: hysteresis-in-time defeats limit-cycle chatter (EX-5).
+ *   M >> N by design: hysteresis-in-time defeats limit-cycle chatter.
  * ========================================================================== */
-#define FAULT_TRIP_N          3         /* faulty ticks to trip IDLE/PID->FAULT*/
-#define FAULT_RECOVER_M       10        /* sane ticks to recover FAULT->IDLE  */
+#define FAULT_TRIP_N          3         /* faulty ticks to trip -> FAULT      */
+#define FAULT_RECOVER_M       10        /* sane ticks to recover -> IDLE      */
 
 /* ============================================================================
  * COOLING parameters
- *   COOL_THRESH_C        : "cool enough to stop" temperature
- *   COOLING_TIMEOUT_TICKS: ~3 * tau backstop - cool even if sensor is lying
  * ========================================================================== */
 #define COOL_THRESH_C            35.0f
 #define COOLING_TIMEOUT_TICKS    400    /* ~6.5 min at 1 Hz (3 * tau_eff)     */
@@ -121,9 +109,8 @@ typedef enum {
  * ZoneCtrl - the unit of replication
  *   One instance per physical zone. All per-zone state lives here so:
  *     - Zone 1 FAULT cannot halt Zone 2 (fault isolation)
- *     - PID integrator + debounce counters reset cleanly on entry (bumpless)
- *     - trivially becomes a FreeRTOS task body in Topic 8
- *     - trivially becomes a remote node over I2C in Topic 9
+ *     - PID + debounce counters reset cleanly on entry (bumpless)
+ *     - trivially becomes a remote node over a bus later
  * ========================================================================== */
 typedef struct {
     const char     *name;            /* "Z1", "Z2" - for OLED/logs            */
@@ -133,13 +120,13 @@ typedef struct {
     uint8_t         recover_count;   /* debounce: ticks signal looked sane    */
     uint16_t        cool_ticks;      /* COOLING timeout counter               */
 
-    /* Command flags - written by debugger/UI/comms, consumed by FSM ---------*
-     * volatile: writes can come from any context (ISR, debugger, future task) */
+    /* Command flags - written by UI/comms, consumed by FSM.
+     * volatile: writes can come from any context (ISR, debugger, task).      */
     volatile uint8_t start_req;
     volatile uint8_t stop_req;
     volatile uint8_t ack_req;        /* future: clear a sticky fault          */
 
-    /* Control state -------------------------------------------------------- */
+    /* Control state */
     PID_Handle      pid;
     float           setpoint_c;
     float           duty_cmd;        /* PID output [-1..+1], mirrored global  */
@@ -153,19 +140,12 @@ extern ZoneCtrl zone1;
 extern volatile float g_duty_cmd;
 extern volatile float g_setpoint_c;     /* kept for legacy Live Expressions   */
 extern volatile float g_fan_duty;
-extern PID_Handle pid;                  /* legacy alias, points at zone1.pid  */
+extern PID_Handle pid;                  /* legacy alias                       */
 
 /* ============================================================================
  * DUAL LOG STREAMS
- *
- * Stream 1 (DENSE) - continuous physics, one entry per tick.
- *   Things that always change because of physical dynamics.
- *
- * Stream 2 (SPARSE) - discrete events, one entry per CHANGE.
- *   Things that mostly stay constant; logging every tick is waste.
- *
- * Edge-detected in ThermalApp_Loop using sentinel-init "last seen" vars,
- * so the first tick always emits the boot state as event #0.
+ *   Stream 1 (DENSE)  - one entry per tick (continuous physics).
+ *   Stream 2 (SPARSE) - one entry per CHANGE (edge-detected events).
  * ========================================================================== */
 
 /* ---- Stream 1: per-tick time series --------------------------------------*/
@@ -175,7 +155,7 @@ typedef struct {
     float temp_ema;     /* EMA-filtered temp (what PID actually saw)         */
     float vnode;        /* raw ADC voltage - sensor truth, fault forensics   */
     float duty_cmd;     /* signed [-1..+1]; sign splits heater/fan downstream*/
-} ThermalLogEntry;      /* 20 bytes - same footprint as before, more info    */
+} ThermalLogEntry;
 
 /* ---- Stream 2: event kinds -----------------------------------------------*/
 typedef enum {
@@ -183,7 +163,7 @@ typedef enum {
     EV_STATE_CHANGE  = 1,   /* u8_payload = new ThermalState                 */
     EV_FAULT_RAISED  = 2,   /* u8_payload = FaultReason                      */
     EV_FAULT_CLEARED = 3,   /* u8_payload = previous FaultReason             */
-    EV_SETPOINT_CHG  = 4,   /* f_payload  = new setpoint (°C)                */
+    EV_SETPOINT_CHG  = 4,   /* f_payload  = new setpoint (C)                 */
     EV_START_REQ     = 5,
     EV_STOP_REQ      = 6,
 } EventKind;
@@ -194,9 +174,9 @@ typedef struct {
     uint8_t  u8_payload;
     uint16_t _pad;          /* keep struct 12-byte, naturally aligned        */
     float    f_payload;
-} ThermalEvent;             /* 12 bytes                                      */
+} ThermalEvent;
 
-#define THERM_EVENT_LEN     64      /* 64 × 12 = 768 B - plenty              */
+#define THERM_EVENT_LEN     64      /* 64 x 12 = 768 B                       */
 
 /* ---- Globals (defined in thermal_app.c) ----------------------------------*/
 extern ThermalLogEntry thermal_log[THERM_LOG_LEN];
@@ -205,7 +185,6 @@ extern volatile uint32_t thermal_log_idx;
 extern ThermalEvent thermal_events[THERM_EVENT_LEN];
 extern volatile uint32_t thermal_event_idx;
 
-
 /* Debug read-back (Live Expressions) */
 extern volatile uint32_t dbg_adc_avg;
 extern volatile float    dbg_vnode;
@@ -213,12 +192,20 @@ extern volatile float    dbg_rntc;
 extern volatile float    dbg_temp_c;
 
 /* ============================================================================
- * PUBLIC API
+ * PUBLIC API  (FreeRTOS)
+ *   ThermalApp_Init        : seed PID/EMA, PWM safe state, splash. Call ONCE
+ *                            before the scheduler starts.
+ *   ThermalApp_StartTasks  : create queue + ControlTask + UITask, then start
+ *                            the TIM2 heartbeat. Call ONCE before osKernelStart.
+ *   ThermalApp_TickISR     : called from the TIM2 period-elapsed callback;
+ *                            posts EVT_PID_TICK to the control queue.
+ *   Zone_Tick              : the FSM for one zone (the unit of replication).
  * ========================================================================== */
 void ThermalApp_Init(void);
-void ThermalApp_Loop(void);
+void ThermalApp_StartTasks(void);
+void ThermalApp_TickISR(void);
 
-/* Tick the FSM. Called from EVT_PID_TICK with all signals it needs.
+/* Tick the FSM. Called from ControlTask on EVT_PID_TICK with all signals:
  *   vnode    : RAW node voltage  (safety path - no EMA lag)
  *   raw_t_c  : RAW temperature   (log, threshold checks)
  *   ema_t_c  : EMA-filtered temp (control path - feeds PID)                  */

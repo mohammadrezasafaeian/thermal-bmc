@@ -143,16 +143,14 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
-  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
+  ThermalApp_StartTasks();
   osKernelStart();
-
   /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
@@ -162,35 +160,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	     ThermalApp_Loop();
-	     /*
-	      * ThermalApp_Loop() now runs the full pipeline every second (1 Hz):
-	      *   ADC → physics → PID control → EMA → plot → PWM → log → OLED.
-	      *
-	      * ── Adjusting the setpoint ──────────────────────────────────────
-	      *   In Live Expressions, type:
-	      *       g_setpoint_c
-	      *   and change its value, e.g. 30.0 → 35.0.
-	      *   The PID will bring the temperature to the new target smoothly.
-	      *
-	      * ── Monitoring the controller ────────────────────────────────────
-	      *   Add these to Live Expressions:
-	      *       pid.integral
-	      *       pid.deriv
-	      *   to see the integrator and derivative states.
-	      *
-	      * ── Exporting the log buffer ─────────────────────────────────────
-	      *   Exactly as before:
-	      *     1. Pause the debugger.
-	      *     2. Window → Show View → Memory Browser.
-	      *     3. Enter symbol:  thermal_log
-	      *     4. Export → Raw Binary, Length = 24576 (2048 × 12 bytes).
-	      *     5. Parse in Python:
-	      *          import numpy as np
-	      *          data = np.fromfile('thermal_log.bin',
-	      *                             dtype=np.float32).reshape(-1, 3)
-	      *          # columns: [0] time_s  [1] temp_c  [2] duty
-	      */
+
   }
   /* USER CODE END 3 */
 }
@@ -530,8 +500,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         HAL_IncTick();
     }
     else if (htim->Instance == TIM2) { /* our 1 Hz control tick */
-        g_prof.tick_stamp = DWT->CYCCNT;
-        RingBuffer_Push(EVT_PID_TICK);
+
+        ThermalApp_TickISR();
     }
 }
 /*
@@ -560,8 +530,8 @@ void StartDefaultTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
-  }
+	  ThermalApp_Loop();
+	  osDelay(1);  }
   /* USER CODE END 5 */
 }
 

@@ -1,48 +1,57 @@
 /* ==========================================================================
- * thermal_app.c  --  Thermal Logger with per-zone FSM + PID
+ * thermal_app.c  --  Dual-zone thermal controller (FreeRTOS)
  * Target : STM32F411CEU6 @ 24 MHz (HSI/PLL, verified via TIM2 cross-check)
  *
- * ARCHITECTURE
- * ============
- *   main.c  -> ThermalApp_Init()  once
- *           -> ThermalApp_Loop()  forever
+ * ARCHITECTURE (FreeRTOS, preemptive)
+ * ===================================
+ *   main.c -> ThermalApp_Init()       once, before scheduler (seed + splash)
+ *          -> ThermalApp_StartTasks() once, creates queue + tasks + heartbeat
+ *          -> osKernelStart()         scheduler takes over forever
  *
- *   TIM2 ISR @ 1 Hz stamps DWT->CYCCNT into g_prof.tick_stamp, then pushes
- *   EVT_PID_TICK into the ring buffer. ThermalApp_Loop drains the queue.
- *   On EVT_PID_TICK:
- *      1. ADC oversample -> V_node -> R_ntc -> raw_t_c
- *      2. pid_temp EMA   (control-path filter)
- *      3. Zone_Tick(...)  ONE call - the tick IS the loop, no inner spin
- *      4. log, OLED throttle
- *      5. pwm_update at the bottom of the loop
+ *   TIM2 ISR @ 1 Hz  : stamps DWT->CYCCNT, posts EVT_PID_TICK to xCtrlQueue,
+ *                      yields to ControlTask if it just woke (zero latency).
  *
- * PROFILING (Phase 0 baseline for FreeRTOS migration)
- * ============
- *   g_prof (cyc.h) - single Live Expressions entry:
- *      lat_*_us  : TIM2 ISR -> EVT_PID_TICK drain latency (the headline)
- *      adc_us    : one adc_average() oversample burst
- *      oled_us   : one oled_update() I2C redraw (+ worst case)
- *      ctrl_us   : whole control body (EMA+FSM+PID+log)
- *   All in microseconds via CYC_TO_US (CPU_HZ = 24 MHz in cyc.h).
+ *   ControlTask (pri 3): BLOCKS on xCtrlQueue. On each tick runs the sacred
+ *                        control chain: ADC -> EMA -> Zone_Tick(FSM/PID)
+ *                        -> safety backstop -> log -> PWM. Deterministic.
+ *
+ *   UITask      (pri 1): vTaskDelay(100ms) = 10 Hz. Own ADC read (diagnostics
+ *                        + loose-wire feedback), display EMAs, OLED redraw.
+ *                        If the OLED/I2C wedges, only UITask stalls; the
+ *                        heater control (higher priority) is unaffected.
+ *
+ *   SHARED ADC1 : both tasks call adc_average() -> collision possible.
+ *                 Mitigated next step by a mutex (DMA is the longer-term fix).
  *
  * MENTAL MODEL
  * ============
  *   TICK = WHEN, STATE = WHAT.
- *   Two signals, two bandwidths:
- *      CONTROL path -> ema_temp  (slow, noise-reject)  -> PID
- *      SAFETY  path -> raw vnode (fast, exact)         -> fault detect
- *   Time-domain Schmitt for debounce: integer count on RAW (not EMA).
+ *   CONTROL path -> ema_temp (slow, noise-reject) -> PID
+ *   SAFETY  path -> raw vnode (fast, exact)        -> fault detect
  *   Per-zone state = per-zone fault isolation.
  * ==========================================================================*/
 
 #include "thermal_app.h"
 #include "ssd1306.h"
-#include "ring_buf.h"
+#include "ring_buf.h"          /* still needed: Event_t / EVT_* live here    */
 #include "cyc.h"
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+
+/* ============================================================================
+ * RTOS OBJECTS + FORWARD DECLARATIONS
+ * ========================================================================== */
+static QueueHandle_t xCtrlQueue;            /* ISR -> ControlTask mailbox     */
+
+static void ControlTask(void const *argument);
+static void UITask(void const *argument);
+static void emit_change_events(ZoneCtrl *z);
 
 #define THERMAL_LOG_MAGIC  0xC0FFEE42u
 
@@ -54,6 +63,7 @@ extern ADC_HandleTypeDef hadc1;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern I2C_HandleTypeDef hi2c1;
+
 /* ============================================================================
  * PUBLIC GLOBALS
  * ========================================================================== */
@@ -69,7 +79,7 @@ volatile float g_duty_cmd   = 0.0f;
 volatile float g_setpoint_c = 30.0f;    /* legacy: kept for old Live Expr     */
 volatile float g_fan_duty   = 0.0f;
 
-PID_Handle pid;                          /* legacy alias - copy from zone1    */
+PID_Handle pid;                          /* legacy alias                       */
 
 __attribute__((aligned(4), section(".noinit")))
 ThermalLogEntry thermal_log[THERM_LOG_LEN];
@@ -77,38 +87,34 @@ ThermalLogEntry thermal_log[THERM_LOG_LEN];
 __attribute__((aligned(4), section(".noinit")))
 ThermalEvent thermal_events[THERM_EVENT_LEN];
 
-__attribute__((section(".noinit")))
-volatile uint32_t thermal_log_idx;
+__attribute__((section(".noinit"))) volatile uint32_t thermal_log_idx;
+__attribute__((section(".noinit"))) volatile uint32_t thermal_event_idx;
 
-__attribute__((section(".noinit")))
-volatile uint32_t thermal_event_idx;
-
-/* Debug read-back globals */
+/* Debug read-back globals (Live Expressions) */
 volatile uint32_t dbg_adc_avg = 0;
 volatile float    dbg_vnode   = 0.0f;
 volatile float    dbg_rntc    = 0.0f;
 volatile float    dbg_temp_c  = 0.0f;
 
-/* DWT profiling - ALL timing lives here. Add "g_prof" to Live Expressions. */
+/* DWT profiling - add "g_prof" to Live Expressions. */
 volatile Profiler g_prof = { .lat_min_us = 0xFFFFFFFFu };
 
 /* ============================================================================
  * PRIVATE STATE
  * ========================================================================== */
-static float   plot_buf[THERM_PLOT_LEN];
+static float   plot_buf[THERM_PLOT_LEN]; /* scrolling display ring (UITask)   */
 static uint8_t plot_head = 0;
 
-static float   ema_temp_display = 0.0f;
-static float   ema_mean         = 0.0f;
-static float   ema_dev          = 1.0f;
+static float   ema_temp_display = 0.0f;  /* smoothed temp for OLED + plot      */
+static float   ema_mean         = 0.0f;  /* plot auto-scale centre             */
+static float   ema_dev          = 1.0f;  /* plot auto-scale half-span          */
 static uint8_t ema_initialized  = 0;
 
-static float   pid_temp         = 0.0f;  /* EMA-filtered temp for PID input  */
+static float   pid_temp         = 0.0f;  /* control-path EMA, feeds PID        */
 
 /* ============================================================================
- * SENSING HELPERS  (unchanged from pre-FSM version)
+ * SENSING HELPERS
  * ========================================================================== */
-
 static uint32_t adc_average(uint8_t n)
 {
     uint32_t sum = 0;
@@ -149,9 +155,7 @@ static inline float ema_step(float state, float value, float alpha)
 }
 
 /* ============================================================================
- * PWM OUTPUT
- *   Reads g_duty_cmd [-1..+1] and splits into heater (CH1) / fan (CH2).
- *   Single point of contact with the hardware - FSM only writes g_duty_cmd.
+ * PWM OUTPUT  - g_duty_cmd [-1..+1] split into heater (CH1) / fan (CH2).
  * ========================================================================== */
 static void pwm_update(void)
 {
@@ -172,7 +176,7 @@ static void pwm_update(void)
 }
 
 /* ============================================================================
- * STREAM 1 - dense per-tick log
+ * LOGGING  - Stream 1 (dense per-tick) + Stream 2 (sparse events)
  * ========================================================================== */
 static void log_sample(float temp_c, float temp_ema, float vnode, float duty)
 {
@@ -185,9 +189,6 @@ static void log_sample(float temp_c, float temp_ema, float vnode, float duty)
     thermal_log_idx++;
 }
 
-/* ============================================================================
- * STREAM 2 - sparse event log (one entry per CHANGE)
- * ========================================================================== */
 static void event_log(EventKind kind, uint8_t u8, float f)
 {
     uint32_t idx = thermal_event_idx % THERM_EVENT_LEN;
@@ -199,26 +200,26 @@ static void event_log(EventKind kind, uint8_t u8, float f)
     thermal_event_idx++;
 }
 
-/* ---- emit_change_events: edge detector ---------------------------------- */
+/* Edge detector: log a field ONLY when it changes (not every tick).
+ * static "last_*" vars remember the previous value across calls;
+ * impossible seeds (0xFF / -1000) force the boot state to log once. */
 static void emit_change_events(ZoneCtrl *z)
 {
-    static uint8_t last_state        = 0xFF;     /* impossible -> first tick logs */
+    static uint8_t last_state        = 0xFF;
     static uint8_t last_fault_reason = 0xFF;
-    static float   last_setpoint     = -1000.0f; /* impossible setpoint           */
+    static float   last_setpoint     = -1000.0f;
 
     if (z->state != last_state) {
         event_log(EV_STATE_CHANGE, z->state, 0.0f);
         last_state = z->state;
     }
-
     if (z->fault_reason != last_fault_reason) {
         if (z->fault_reason == FR_NONE)
-            event_log(EV_FAULT_CLEARED, last_fault_reason, 0.0f);
+            event_log(EV_FAULT_CLEARED, last_fault_reason, 0.0f); /* old fault */
         else
             event_log(EV_FAULT_RAISED,  z->fault_reason,   0.0f);
         last_fault_reason = z->fault_reason;
     }
-
     if (z->setpoint_c != last_setpoint) {
         event_log(EV_SETPOINT_CHG, 0, z->setpoint_c);
         last_setpoint = z->setpoint_c;
@@ -226,10 +227,12 @@ static void emit_change_events(ZoneCtrl *z)
 }
 
 /* ============================================================================
- * OLED  (unchanged - just renders whatever's in plot_buf + globals)
+ * OLED RENDER  - reads plot_buf + globals, draws one frame.
  * ========================================================================== */
 static int format_fixed1(char *buf, int buf_len, float val)
 {
+    /* Print one decimal place using INTEGER formatting only
+     * (newlib-nano %f is huge/slow). 23.7 -> whole=23, frac=7. */
     int sign = (val < 0.0f) ? 1 : 0;
     if (sign) val = -val;
     int32_t tenths = (int32_t)(val * 10.0f + 0.5f);
@@ -297,43 +300,36 @@ static void oled_update(uint32_t adc_avg, float vnode, float rntc,
 }
 
 /* ============================================================================
- * FSM HELPERS - small, single-purpose, no hidden side effects
+ * FSM HELPERS
  * ========================================================================== */
-
-/* detect_fault: pure function of RAW vnode. Caller debounces in time. */
 static FaultReason detect_fault(float vnode)
 {
     if (vnode > V_OPEN_THRESH)  return FR_NTC_OPEN;
     if (vnode < V_SHORT_THRESH) return FR_NTC_SHORT;
     return FR_NONE;
-    /* FR_HEATER_OPEN / FR_FAN_OPEN: hooks for Topic 11 (current sense). */
 }
 
-/* zone_actuators_off: hardware-level cut. Used on every safety transition. */
 static void zone_actuators_off(ZoneCtrl *z)
 {
     z->duty_cmd = 0.0f;
-    g_duty_cmd  = 0.0f;     /* mirror - pwm_update writes 0 at end of loop  */
+    g_duty_cmd  = 0.0f;
 }
 
-/* zone_enter_pid: SINGLE entry path to PID state. Bumpless transfer. */
 static void zone_enter_pid(ZoneCtrl *z, float seed_temp_c)
 {
-    pid_temp = seed_temp_c;              /* snap EMA to current truth */
+    pid_temp = seed_temp_c;                 /* bumpless: snap EMA to truth     */
     PID_Init(&z->pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, seed_temp_c);
     z->fault_count   = 0;
     z->recover_count = 0;
     z->state         = ST_PID;
 }
 
-/* zone_enter_cooling: stop requested, graceful shutdown. */
 static void zone_enter_cooling(ZoneCtrl *z)
 {
     z->cool_ticks = 0;
     z->state      = ST_COOLING;
 }
 
-/* zone_enter_fault: cut on the transition (sub-tick latency). */
 static void zone_enter_fault(ZoneCtrl *z, FaultReason r)
 {
     zone_actuators_off(z);
@@ -343,7 +339,7 @@ static void zone_enter_fault(ZoneCtrl *z, FaultReason r)
 }
 
 /* ============================================================================
- * Zone_Tick - THE FSM  (unchanged)
+ * Zone_Tick - THE FSM (one zone per call; the unit of replication)
  * ========================================================================== */
 void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
 {
@@ -353,19 +349,14 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
 
     case ST_IDLE:
         zone_actuators_off(z);
-
         if (z->start_req) {
             z->start_req = 0;
-            if (fault_candidate == FR_NONE) {
-                zone_enter_pid(z, raw_t_c);   /* RAW so snap is meaningful */
-            } else {
-                zone_enter_fault(z, fault_candidate);
-            }
+            if (fault_candidate == FR_NONE) zone_enter_pid(z, raw_t_c);
+            else                            zone_enter_fault(z, fault_candidate);
         }
         break;
 
     case ST_PID:
-        /* Fault debounce on RAW signal (time-domain Schmitt) */
         if (fault_candidate != FR_NONE) {
             z->fault_count++;
             if (z->fault_count >= FAULT_TRIP_N) {
@@ -375,27 +366,23 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
         } else {
             z->fault_count = 0;
         }
-
         if (z->stop_req) {
             z->stop_req = 0;
             zone_enter_cooling(z);
             break;
         }
-
         z->duty_cmd = PID_Update(&z->pid, z->setpoint_c, ema_t_c);
         g_duty_cmd  = z->duty_cmd;
         break;
 
     case ST_COOLING:
-        z->duty_cmd = -1.0f;            /* fan full on, heater off          */
+        z->duty_cmd = -1.0f;                 /* fan full on, heater off        */
         g_duty_cmd  = z->duty_cmd;
         z->cool_ticks++;
-
         {
             uint8_t cool_now  = (raw_t_c < COOL_THRESH_C);
             uint8_t sane      = (fault_candidate == FR_NONE);
             uint8_t timed_out = (z->cool_ticks >= COOLING_TIMEOUT_TICKS);
-
             if ((cool_now && sane) || timed_out) {
                 zone_actuators_off(z);
                 z->state = ST_IDLE;
@@ -405,23 +392,147 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
 
     case ST_FAULT:
         zone_actuators_off(z);
-
         if (fault_candidate == FR_NONE) {
             z->recover_count++;
             if (z->recover_count >= FAULT_RECOVER_M) {
                 z->fault_reason  = FR_NONE;
                 z->recover_count = 0;
-                z->state         = ST_IDLE;   /* never -> PID; operator must start */
+                z->state         = ST_IDLE; /* operator must re-start          */
             }
         } else {
-            z->recover_count = 0;             /* glitch breaks the streak   */
+            z->recover_count = 0;
         }
         break;
 
     default:
-        zone_enter_fault(z, FR_NONE);   /* unknown state -> safe-park       */
+        zone_enter_fault(z, FR_NONE);
         break;
     }
+}
+
+/* ============================================================================
+ * CONTROL TASK  (priority 3) - blocks on the queue, runs the control chain.
+ * ========================================================================== */
+static void ControlTask(void const *argument)
+{
+    (void)argument;
+    Event_t evt;
+
+    for (;;)
+    {
+        /* Sleep here at 0% CPU until the TIM2 ISR posts a tick. */
+        if (xQueueReceive(xCtrlQueue, &evt, portMAX_DELAY) != pdPASS) continue;
+
+        switch (evt)
+        {
+        case EVT_PID_TICK:
+        {
+            /* tick -> wake latency (the headline RTOS metric) */
+            uint32_t lat = CYC_TO_US(DWT->CYCCNT - g_prof.tick_stamp);
+            g_prof.lat_last_us = lat;
+            if (lat > g_prof.lat_max_us) g_prof.lat_max_us = lat;
+            if (lat < g_prof.lat_min_us) g_prof.lat_min_us = lat;
+            g_prof.tick_count++;
+
+            uint32_t tc0 = DWT->CYCCNT;       /* control body start           */
+
+            /* SENSE (control path) */
+            uint32_t adc_avg = adc_average(THERM_ADC_OVERSAMPLE);
+            float vnode  = THERM_ADC_VREF * ((float)adc_avg / 4095.0f);
+            float rntc   = adc_to_rntc(adc_avg);
+            float temp_c = rntc_to_celsius(rntc);
+
+            /* Control-path EMA (only while controlling) */
+            if (zone1.state == ST_PID) {
+                pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
+            }
+
+            /* FSM + PID */
+            Zone_Tick(&zone1, vnode, temp_c, pid_temp);
+
+            /* Hard safety backstop - independent of FSM */
+            if (temp_c > MAX_SAFE_TEMP_C) {
+                g_duty_cmd     = 0.0f;
+                zone1.duty_cmd = 0.0f;
+            }
+
+            /* Logging (plot is owned by UITask, not pushed here) */
+            log_sample(temp_c, pid_temp, vnode, g_duty_cmd);
+            emit_change_events(&zone1);
+
+            /* Actuate */
+            pwm_update();
+
+            g_prof.ctrl_us = CYC_TO_US(DWT->CYCCNT - tc0);
+            break;
+        }
+
+        case EVT_START_CMD: zone1.start_req = 1; break;
+        case EVT_STOP_CMD:  zone1.stop_req  = 1; break;
+        default: break;
+        }
+    }
+}
+
+/* ============================================================================
+ * UI TASK  (priority 1) - 10 Hz diagnostics + OLED. Fault-isolated from control.
+ * ========================================================================== */
+static void UITask(void const *argument)
+{
+    (void)argument;
+
+    for (;;)
+    {
+        /* Fast diagnostic read (catches loose wires the 1 Hz path would miss) */
+        uint32_t adc_avg = adc_average(THERM_ADC_OVERSAMPLE);
+        float vnode  = THERM_ADC_VREF * ((float)adc_avg / 4095.0f);
+        float rntc   = adc_to_rntc(adc_avg);
+        float temp_c = rntc_to_celsius(rntc);
+
+        dbg_adc_avg = adc_avg; dbg_vnode = vnode;
+        dbg_rntc = rntc;       dbg_temp_c = temp_c;
+
+        /* Display EMAs (smoothing + plot auto-scale centre/span) */
+        if (!ema_initialized) {
+            ema_temp_display = temp_c;
+            ema_mean         = temp_c;
+            ema_dev          = 1.0f;
+            ema_initialized  = 1;
+        } else {
+            ema_temp_display = ema_step(ema_temp_display, temp_c, THERM_EMA_DISPLAY);
+            ema_mean         = ema_step(ema_mean, ema_temp_display, THERM_EMA_MEAN);
+            float abs_dev = ema_temp_display - ema_mean;
+            if (abs_dev < 0.0f) abs_dev = -abs_dev;
+            ema_dev = ema_step(ema_dev, abs_dev, THERM_EMA_DEV);
+            if (ema_dev < 0.05f) ema_dev = 0.05f;
+        }
+
+        /* Scroll the plot (UITask is the SOLE writer of plot_buf) */
+        plot_buf[plot_head] = ema_temp_display;
+        plot_head = (uint8_t)((plot_head + 1) % THERM_PLOT_LEN);
+
+        int duty_pct = (int)(g_duty_cmd * 100.0f + 0.5f);
+        if (duty_pct < -100) duty_pct = -100;
+        if (duty_pct >  100) duty_pct =  100;
+
+        oled_update(adc_avg, vnode, rntc, ema_temp_display, duty_pct);
+
+        vTaskDelay(pdMS_TO_TICKS(100));      /* 10 Hz                          */
+    }
+}
+
+/* ============================================================================
+ * ISR ACCESSOR  - called from TIM2 callback in main.c. Posts the tick.
+ *   Two args use &: the queue copies FROM &evt; it writes the wake answer
+ *   INTO &woken. portYIELD reads woken's value (no &) to decide the switch.
+ * ========================================================================== */
+void ThermalApp_TickISR(void)
+{
+    g_prof.tick_stamp = DWT->CYCCNT;             /* when the tick fired        */
+    BaseType_t woken = pdFALSE;                  /* "woke nobody" until proven */
+    Event_t evt = EVT_PID_TICK;
+    xQueueSendFromISR(xCtrlQueue, &evt, &woken); /* ISR-safe post              */
+    portYIELD_FROM_ISR(woken);                   /* switch to ControlTask now  */
 }
 
 /* ============================================================================
@@ -429,28 +540,19 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
  * ========================================================================== */
 void ThermalApp_Init(void)
 {
-    /* 0. Start the cycle counter FIRST - every later block gets profiled. */
-    cyc_init();
+    cyc_init();                              /* DWT cycle counter first        */
 
-    /* 1. Drain event queue before any ISR can push to it */
-    RingBuffer_Init();
-    /* ── SPSC boot self-test (TEMPORARY - delete after one green run) ──
-     * Must run BEFORE HAL_TIM_Base_Start_IT(&htim2) at the bottom of this
-     * function: the queue must have no other producer while we test it.
-     * rb_test_result == 0 means every property holds. Each bit = one
-     * specific broken property.                                          */
-
-    /* 2. Start PWM channels at 0 % (safe state) */
+    /* PWM channels at 0% (safe state) */
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
 
-    /* plot_buf is not in .noinit - always clear (display state, not log). */
+    /* Display buffer is not persistent - always clear */
     memset(plot_buf, 0, sizeof(plot_buf));
     plot_head = 0;
 
-    /* Black-box logs: only clear on COLD boot. Magic word distinguishes. */
+    /* Black-box logs survive warm reset; clear only on COLD boot */
     if (thermal_log_magic != THERMAL_LOG_MAGIC) {
         memset(thermal_log,    0, sizeof(thermal_log));
         memset(thermal_events, 0, sizeof(thermal_events));
@@ -458,15 +560,12 @@ void ThermalApp_Init(void)
         thermal_event_idx = 0;
         thermal_log_magic = THERMAL_LOG_MAGIC;
     }
-    /* On warm boot: do nothing - buffers retain previous run's data. */
 
-    /* 4. Initial temperature reading (seeds PID derivative + EMA) */
+    /* Seed PID + EMA from the true ambient (no derivative kick) */
     uint32_t adc_raw   = adc_average(THERM_ADC_OVERSAMPLE);
-    float    init_rntc = adc_to_rntc(adc_raw);
-    float    init_temp = rntc_to_celsius(init_rntc);
+    float    init_temp = rntc_to_celsius(adc_to_rntc(adc_raw));
     pid_temp = init_temp;
 
-    /* 5. Seed PID inside the zone. State remains ST_IDLE. */
     PID_Init(&zone1.pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, init_temp);
     zone1.state         = ST_IDLE;
     zone1.fault_reason  = FR_NONE;
@@ -474,149 +573,22 @@ void ThermalApp_Init(void)
     zone1.recover_count = 0;
     zone1.cool_ticks    = 0;
 
-    /* 6. Splash screen */
+    /* Splash (pre-scheduler blocking delay is fine; HAL tick = TIM11) */
     ssd1306_clear();
     ssd1306_print(0, 0,  "THERMAL FSM");
-    ssd1306_print(0, 16, "V0.8 PROF");
+    ssd1306_print(0, 16, "V1.0 RTOS");
     ssd1306_update();
     HAL_Delay(800);
-
-    /* 7. LAST: start the 1 Hz heartbeat. After this line, ISR can fire. */
-    HAL_TIM_Base_Start_IT(&htim2);
 }
 
-void ThermalApp_Loop(void)
+/* Create queue + tasks, THEN start the heartbeat.
+ * ORDER: the queue MUST exist before the timer fires (the ISR posts into it). */
+void ThermalApp_StartTasks(void)
 {
-    Event_t current_event;
-    g_prof.loop_count++;
-    /* ── FAKE HUNG NODE (Phase 0 experiment - TEMPORARY) ──────────────────
-     * Simulates polling a dead ATmega32 zone node: address 0x42, nobody
-     * home. HAL retries until the 100 ms timeout expires. This is what a
-     * crashed slave does to a super-loop.                                 */
-    {
-        uint8_t dummy;
-        uint32_t tn0 = DWT->CYCCNT;
-        HAL_I2C_Master_Receive(&hi2c1, (0x42 << 1), &dummy, 1, 100);
-        g_prof.node_us = CYC_TO_US(DWT->CYCCNT - tn0);
-    }
-    /* --- STEP 1: SENSING (every loop iteration, regardless of events) --- */
-    uint32_t t0 = DWT->CYCCNT;
-    uint32_t adc_avg = adc_average(THERM_ADC_OVERSAMPLE);
-    g_prof.adc_us = CYC_TO_US(DWT->CYCCNT - t0);
+    xCtrlQueue = xQueueCreate(8, sizeof(Event_t));
 
-    float vnode  = THERM_ADC_VREF * ((float)adc_avg / 4095.0f);
-    float rntc   = adc_to_rntc(adc_avg);
-    float temp_c = rntc_to_celsius(rntc);
+    xTaskCreate(ControlTask, "Ctrl", 512, NULL, 3, NULL);
+    xTaskCreate(UITask,      "UI",   512, NULL, 1, NULL);
 
-    dbg_adc_avg = adc_avg;
-    dbg_vnode   = vnode;
-    dbg_rntc    = rntc;
-    dbg_temp_c  = temp_c;
-
-    /* --- STEP 2: EVENT DRAIN --- */
-    while (RingBuffer_Pop(&current_event))
-    {
-        switch (current_event)
-        {
-        case EVT_PID_TICK:
-        {
-            /* ── PROFILE: tick -> drain latency (the headline number) ──── */
-            uint32_t lat = CYC_TO_US(DWT->CYCCNT - g_prof.tick_stamp);
-            g_prof.lat_last_us = lat;
-            if (lat > g_prof.lat_max_us) g_prof.lat_max_us = lat;
-            if (lat < g_prof.lat_min_us) g_prof.lat_min_us = lat;
-            g_prof.tick_count++;
-
-            uint32_t tc0 = DWT->CYCCNT;          /* control body start     */
-
-            /* Control-path EMA - only when controller is alive. */
-            if (zone1.state == ST_PID) {
-                pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
-            }
-
-        #if OPEN_LOOP_TEST_MODE
-            /* Bypass FSM entirely for plant ID step test. */
-            if (g_prof.tick_count <= OPEN_LOOP_BASELINE_SEC) {
-                g_duty_cmd = 0.0f;
-            } else if (g_prof.tick_count <= OPEN_LOOP_BASELINE_SEC + OPEN_LOOP_RUN_SEC) {
-                g_duty_cmd = OPEN_LOOP_DUTY;
-            } else {
-                g_duty_cmd = 0.0f;
-            }
-        #else
-            /* Normal path: FSM runs the show. */
-            Zone_Tick(&zone1, vnode, temp_c, pid_temp);
-        #endif
-
-            /* Hard safety backstop - independent of FSM. */
-            if (temp_c > MAX_SAFE_TEMP_C) {
-                g_duty_cmd     = 0.0f;
-                zone1.duty_cmd = 0.0f;
-            }
-
-            /* Display-side EMAs (cosmetic, for plot) */
-            if (!ema_initialized) {
-                ema_temp_display = temp_c;
-                ema_mean         = temp_c;
-                ema_dev          = 1.0f;
-                ema_initialized  = 1;
-            } else {
-                ema_temp_display = ema_step(ema_temp_display, temp_c, THERM_EMA_DISPLAY);
-                ema_mean         = ema_step(ema_mean, ema_temp_display, THERM_EMA_MEAN);
-                float abs_dev = ema_temp_display - ema_mean;
-                if (abs_dev < 0.0f) abs_dev = -abs_dev;
-                ema_dev = ema_step(ema_dev, abs_dev, THERM_EMA_DEV);
-                if (ema_dev < 0.05f) ema_dev = 0.05f;
-            }
-
-            plot_buf[plot_head] = ema_temp_display;
-            plot_head = (uint8_t)((plot_head + 1) % THERM_PLOT_LEN);
-
-            /* Stream 1: dense per-tick data (RAW temp - plant ID needs it) */
-            log_sample(temp_c, pid_temp, vnode, g_duty_cmd);
-
-            /* Stream 2: edge-detected sparse events */
-            emit_change_events(&zone1);
-
-            /* ── PROFILE: control body cost ─────────────────────────────── */
-            g_prof.ctrl_us = CYC_TO_US(DWT->CYCCNT - tc0);
-            break;
-        }
-
-        case EVT_START_CMD:
-            zone1.start_req = 1;
-            break;
-
-        case EVT_STOP_CMD:
-            zone1.stop_req = 1;
-            break;
-
-        default:
-            break;
-        }
-    }
-
-    /* --- STEP 3: ACTUATION --- */
-    pwm_update();
-
-    /* --- STEP 4: UI (throttled by THERM_OLED_DIVIDER) --- */
-    {
-        static uint8_t oled_div = 0;
-        oled_div++;
-        if (oled_div >= THERM_OLED_DIVIDER) {
-            oled_div = 0;
-            int duty_pct = (int)(g_duty_cmd * 100.0f + 0.5f);
-            if (duty_pct < -100) duty_pct = -100;
-            if (duty_pct >  100) duty_pct =  100;
-
-            /* ── PROFILE: OLED redraw cost (the prime suspect) ─────────── */
-            uint32_t t1 = DWT->CYCCNT;
-            oled_update(adc_avg, vnode, rntc, ema_temp_display, duty_pct);
-            g_prof.oled_us = CYC_TO_US(DWT->CYCCNT - t1);
-            if (g_prof.oled_us > g_prof.oled_max_us)
-                g_prof.oled_max_us = g_prof.oled_us;
-        }
-    }
-
-    /* No HAL_Delay - the tick paces the control path; loop runs free. */
+    HAL_TIM_Base_Start_IT(&htim2);           /* LAST: queue now exists         */
 }
