@@ -28,7 +28,8 @@ void PID_Init(PID_Handle *pid,
     pid->integral   = 0.0f;
     pid->deriv      = 0.0f;
 }
-
+float out_min;   /* clamp low  (fan: 0.0)  */
+float out_max;   /* clamp high (fan: 1.0)  */
 /* --------------------------------------------------------------------------
  * PID_Update – call once per sample period
  *
@@ -48,45 +49,36 @@ void PID_Init(PID_Handle *pid,
  * -------------------------------------------------------------------------- */
 float PID_Update(PID_Handle *pid, float setpoint, float measured)
 {
-    float e = setpoint - measured;          /* error                      */
+    float e = setpoint - measured;          /* STANDARD — never negated here  */
 
-    /* 1. Proportional term – the "spring" that pulls toward the setpoint */
-    float P = pid->Kp * e;
+    float P = pid->Kp * e;                  /* sign of Kp sets plant direction */
 
-    /* 2. Integral term (trapezoidal rule) – eliminates steady‑state error */
-    float I = pid->integral;
-    if (pid->Ki > 0.0f) {
-        /* Use the average of the current and previous error (trapezoidal) */
+    if (pid->Ki != 0.0f)
         pid->integral += 0.5f * pid->Ki * pid->Ts * (e + pid->e_prev);
-        I = pid->integral;
-    }
+    float I = pid->integral;
 
-    /* 3. Derivative on measurement (filtered) – the "damper" */
-    /*    We differentiate the measurement, not the error, to avoid large
-     *    spikes when the user changes the setpoint from the debugger.     */
-    float d_raw = -(measured - pid->meas_prev) / pid->Ts;   /* -dy/dt     */
-    pid->deriv = pid->alpha * pid->Kd * d_raw
-               + (1.0f - pid->alpha) * pid->deriv;
+    float d_raw = -(measured - pid->meas_prev) / pid->Ts;
+    pid->deriv = pid->alpha * pid->Kd * d_raw + (1.0f - pid->alpha) * pid->deriv;
     float D = pid->deriv;
 
-    /* 4. Sum and clamp to actuator limits (0 = heater off, 1 = full power) */
     float u = P + I + D;
-    float u_clamped = u;
-    if (u > 1.0f) u_clamped = 1.0f;
-    if (u < -1.0f) u_clamped = -1.0f;
 
-    /* 5. Anti‑windup (conditional integration) */
-    if (pid->Ki > 0.0f && (u_clamped != u)) {
-        /* If the output is stuck high and error is still positive, or
-           stuck low and error is still negative, we undo the increment. */
-        if ((u > 1.0f && e > 0.0f) || (u < -1.0f && e < 0.0f)) {
+    /* per-handle output limits (fan: 0..1; future loops set their own) */
+    float u_clamped = u;
+    if (u > pid->out_max) u_clamped = pid->out_max;
+    if (u < pid->out_min) u_clamped = pid->out_min;
+
+    /* anti-windup: freeze when clamped AND error still pushes further out.
+     * generic — works for either limit, either gain sign. */
+    if (pid->Ki != 0.0f && u_clamped != u) {
+        float push = pid->Ki * e;           /* direction integrator is moving  */
+        if ((u > pid->out_max && push > 0.0f) ||
+            (u < pid->out_min && push < 0.0f)) {
             pid->integral -= 0.5f * pid->Ki * pid->Ts * (e + pid->e_prev);
         }
     }
 
-    /* 6. Store previous values for the next sample */
     pid->e_prev    = e;
     pid->meas_prev = measured;
-
     return u_clamped;
 }

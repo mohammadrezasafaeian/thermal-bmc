@@ -1,0 +1,20 @@
+[33mdbbe5eb[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mdual-zone-thermal-controller[m[33m)[m Move fan to TIM5_CH2 @ 24 kHz (PA1)
+[33me3df0b7[m Add ADC mutex for shared ADC1 (Control + UI tasks)
+[33m467fdc8[m Migrate super-loop to FreeRTOS (ControlTask + UITask + queue)
+[33m5492203[m FreeRTOS skeleton builds
+[33m5e7974c[m Phase 0: DWT profiling + hand-verified ring buffer rewrite
+[33m4569ff7[m test(thermal): verified black-box log survives warm reset; cold-boot via magic mismatch confirmed
+[33mfe380ad[m test(thermal): verification run with hardware fault injection and recovery
+[33m9f71acb[m feat(parser): portfolio plots - overview, detail, walkthrough with FSM diagram
+[33m30b532b[m fix(thermal): freeze EMA outside PID state; clean boot event init
+[33m37c7fec[m feat(parser): dual-stream support with vnode panel and event overlays
+[33m596c6a9[m chore(scripts): remove obsolete plotter; add step-test capture artifacts
+[33mece7b9d[m feat(thermal): per-zone FSM with debounced fault recovery and dual-stream logging
+[33ma3df0e2[m Rebuild ZoneCtrl FSM (IDLE/PID/COOLING done); voltage-based fault detect + debounce; ST_FAULT pending
+[33m382036d[m closed-loop PID verified (Kp=0.10 Ki=0.0008); overshoot 11% matches phase-margin prediction; add response analyzer
+[33m651072d[m add FOPDT/SIMC extractor + fingerprint parser; plant ID K~17 tau~111 theta~10 -> Kp~0.11 Ki~0.0008
+[33mc1c5752[m feat: add Python analysis script with thermal dump parser
+[33m76b5937[m feat: bidirectional PID, output [-1,+1], heater/fan split
+[33mfc716f2[m[33m ([m[1;32mtopic6-state-machine[m[33m, [m[1;32miir-biquad[m[33m)[m feat: thermal controller with dual-PWM, EMA pre-filter, event-driven loop
+[33m7a2e467[m[33m ([m[1;32mmain[m[33m)[m Add IIR lowpass coefficients from Python (Butterworth N=6, fc=50kHz)
+[33m52d83a9[m Initial commit: working scope firmware

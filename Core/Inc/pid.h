@@ -18,6 +18,9 @@ typedef struct {
     float meas_prev;        /* Previous measurement (derivative on meas.) */
     float integral;         /* Integrator state                           */
     float deriv;            /* Filtered derivative state                  */
+    float out_max;
+    float out_min;
+
 } PID_Handle;
 
 /* --- Initialise the PID structure --------------------------------------- *

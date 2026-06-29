@@ -42,8 +42,8 @@
 /* ============================================================================
  * PID GAINS (SIMC from measured plant: K~17, tau~111, theta~10)
  * ========================================================================== */
-#define PID_KP                0.10f
-#define PID_KI                0.0008f
+#define PID_KP                	−0.68
+#define PID_KI                −0.0061
 #define PID_KD                0.0f
 #define PID_TS                1.0f      /* tick period (s)                    */
 #define PID_TAU_F             10.0f     /* derivative filter time const       */
@@ -130,6 +130,8 @@ typedef struct {
     PID_Handle      pid;
     float           setpoint_c;
     float           duty_cmd;        /* PID output [-1..+1], mirrored global  */
+    float           fan_cmd;        /* PID output [-1..+1], mirrored global  */
+
 } ZoneCtrl;
 
 /* ============================================================================
@@ -151,11 +153,13 @@ extern PID_Handle pid;                  /* legacy alias                       */
 /* ---- Stream 1: per-tick time series --------------------------------------*/
 typedef struct {
     float time_s;
-    float temp_c;       /* raw temperature                                   */
-    float temp_ema;     /* EMA-filtered temp (what PID actually saw)         */
-    float vnode;        /* raw ADC voltage - sensor truth, fault forensics   */
-    float duty_cmd;     /* signed [-1..+1]; sign splits heater/fan downstream*/
-} ThermalLogEntry;
+    float temp_c;       /* raw temperature                    */
+    float temp_ema;     /* filtered temp (PID input)          */
+    float vnode;        /* sensor voltage                     */
+    float fan_duty;     /* CONTROLLED cooling [0,1]           */
+    float heater_duty;  /* open-loop chip load [0,1]          */
+    float setpoint;     /* live target                        */
+} ThermalLogEntry;      /* now 28 bytes (was 20)              */
 
 /* ---- Stream 2: event kinds -----------------------------------------------*/
 typedef enum {
@@ -190,7 +194,7 @@ extern volatile uint32_t dbg_adc_avg;
 extern volatile float    dbg_vnode;
 extern volatile float    dbg_rntc;
 extern volatile float    dbg_temp_c;
-
+extern volatile float g_heater_duty;
 /* ============================================================================
  * PUBLIC API  (FreeRTOS)
  *   ThermalApp_Init        : seed PID/EMA, PWM safe state, splash. Call ONCE
