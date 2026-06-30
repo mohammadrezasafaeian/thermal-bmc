@@ -4,21 +4,29 @@
  *
  * MODEL (chip-cooling reframe)
  * ============================
- *   heater = OPEN-LOOP chip load (user sets g_heater_duty in Live Expr).
- *   fan    = the CONTROLLED actuator. PID cools toward setpoint.
- *   Reverse-acting plant: more fan -> lower temp -> PID gains are NEGATIVE.
- *   Fan duty lives in [0,1]; never negative (fan can't heat).
+ *   heater = chip load. Open-loop (user sets g_heater_duty) UNTIL the fan
+ *            saturates, then Mode C throttles it (DVFS analog).
+ *   fan    = the CONTROLLED actuator. Reverse-acting PID (negative gains),
+ *            output clamped [0,1] (fan can't heat, can't exceed full).
  *
- *   FSM:  IDLE --start--> RUNNING(PID) --stop--> COOLDOWN --cool--> IDLE
- *                            |                       ^
- *                          fault                     |
- *                            v                       |
+ *   CONTROL TIERS
+ *     Tier 1 (normal)   : fan PID cools toward setpoint.
+ *     Tier 2 (override) : fan saturated + still hot -> throttle heater.
+ *                         Asymmetric: fast cut, slow restore, fan-headroom
+ *                         deadband prevents hunting. (Mode C)
+ *     Tier 3 (emergency): over-temp / sensor fault -> FAULT (heater off,
+ *                         fan full, latched until cleared).
+ *
+ *   FSM:  IDLE --start--> RUNNING(PID+throttle) --stop--> COOLDOWN --> IDLE
+ *                            |                                ^
+ *                          fault                              |
+ *                            v                                |
  *                          FAULT (heater off, fan full, latched)
- *                            '--- fault clears (debounced) ---> COOLDOWN
- *   Safety: FAULT cuts the heater (overrides user). Recovery lands in IDLE,
- *   never auto-RUNNING (operator must restart).
+ *                            '--- cleared (debounced) ---> COOLDOWN
+ *   Safety: FAULT cuts heater (overrides user). Recovery -> IDLE, never
+ *   auto-RUNNING (operator must restart).
  *
- *   ControlTask (pri 3): blocks on queue, runs sense->FSM->safety->log->PWM.
+ *   ControlTask (pri 3): blocks on queue, sense->FSM->safety->log->PWM.
  *   UITask      (pri 1): 10 Hz OLED + diagnostics, fault-isolated.
  *   ADC1 shared -> xAdcMutex (skipped before scheduler).
  * ==========================================================================*/
@@ -51,7 +59,6 @@ static void zone_enter_cooldown(ZoneCtrl *z);
 
 #define THERMAL_LOG_MAGIC  0xC0FFEE42u
 
-//__attribute__((section(".noinit")))
 uint32_t thermal_log_magic;
 
 /* ── HAL handles (from CubeMX) ──────────────────────────────────────────── */
@@ -69,24 +76,18 @@ ZoneCtrl zone1 = {
     .state        = ST_IDLE,
     .fault_reason = FR_NONE,
     .setpoint_c   = 30.0f,
-    .duty_cmd     = 0.0f,           /* now reused as the FAN command [0,1] */
+    .duty_cmd     = 0.0f,           /* reused as FAN command [0,1] */
 };
 
-/* TWO independent actuators (chip-cooling model) */
-volatile float g_heater_duty = 0.2f;   /* open-loop chip load (you set it)  */
-volatile float g_fan_duty    = 0.0f;   /* PID-controlled cooling [0,1]      */
+volatile float g_heater_duty = 0.2f;   /* chip load (user-set; Mode C throttles) */
+volatile float g_fan_duty    = 0.0f;   /* PID-controlled cooling [0,1]           */
+volatile float g_setpoint_c  = 30.0f;  /* legacy Live Expr alias                 */
 
-volatile float g_setpoint_c  = 30.0f;  /* legacy Live Expr alias            */
+PID_Handle pid;                         /* legacy alias */
 
-PID_Handle pid;                         /* legacy alias                      */
-
-//__attribute__((aligned(4), section(".noinit")))
 ThermalLogEntry thermal_log[THERM_LOG_LEN];
-//__attribute__((aligned(4), section(".noinit")))
-ThermalEvent thermal_events[THERM_EVENT_LEN];
-//__attribute__((section(".noinit")))
+ThermalEvent    thermal_events[THERM_EVENT_LEN];
 volatile uint32_t thermal_log_idx;
-//__attribute__((section(".noinit")))
 volatile uint32_t thermal_event_idx;
 
 volatile uint32_t dbg_adc_avg = 0;
@@ -95,7 +96,7 @@ volatile float    dbg_rntc    = 0.0f;
 volatile float    dbg_temp_c  = 0.0f;
 
 volatile Profiler g_prof = { .lat_min_us = 0xFFFFFFFFu };
-
+volatile float g_heater_request = 0.2f;   /* user's intent (you set THIS)     */
 /* ============================================================================
  * PRIVATE STATE
  * ========================================================================== */
@@ -157,9 +158,9 @@ static inline float ema_step(float state, float value, float alpha)
 }
 
 /* ============================================================================
- * PWM OUTPUT  - TWO independent actuators.
- *   heater (TIM3 CH1, 1 kHz)  <- g_heater_duty  (open-loop chip load)
- *   fan    (TIM5 CH2, 24 kHz) <- g_fan_duty     (PID cooling, clamped [0,1])
+ * PWM OUTPUT  - two independent actuators.
+ *   heater (TIM3 CH1, 1 kHz)  <- g_heater_duty
+ *   fan    (TIM5 CH2, 24 kHz) <- g_fan_duty
  * ========================================================================== */
 static void pwm_update(void)
 {
@@ -189,6 +190,7 @@ static void log_sample(float temp_c, float temp_ema, float vnode,
     thermal_log[idx].setpoint    = setpoint;
     thermal_log_idx++;
 }
+
 static void event_log(EventKind kind, uint8_t u8, float f)
 {
     uint32_t idx = thermal_event_idx % THERM_EVENT_LEN;
@@ -237,7 +239,6 @@ static int format_fixed1(char *buf, int buf_len, float val)
     else      return snprintf(buf, buf_len, "%ld.%ld",  (long)whole, (long)frac);
 }
 
-/* show heater AND fan duty (both actuators now) */
 static void oled_update(uint32_t adc_avg, float vnode, float rntc,
                         float temp_c, int heat_pct, int fan_pct)
 {
@@ -267,7 +268,6 @@ static void oled_update(uint32_t adc_avg, float vnode, float rntc,
         case ST_FAULT:   st_str = "FALT";  break;
     }
 
-    /* In FAULT, show the reason instead of duty (operator needs the cause) */
     if (zone1.state == ST_FAULT) {
         const char *fr = "?";
         switch (zone1.fault_reason) {
@@ -277,8 +277,10 @@ static void oled_update(uint32_t adc_avg, float vnode, float rntc,
         }
         snprintf(buf, sizeof(buf), "%s %s", zone1.name, fr);
     } else {
-        snprintf(buf, sizeof(buf), "%s %s H%2d F%2d",
-                 zone1.name, st_str, heat_pct, fan_pct);
+        /* '!' marks Mode C actively throttling the chip */
+        char thr = (zone1.throttle_count >= THROTTLE_ENGAGE_N) ? '!' : ' ';
+        snprintf(buf, sizeof(buf), "%s %s H%2d F%2d%c",
+                 zone1.name, st_str, heat_pct, fan_pct, thr);
     }
     ssd1306_print(0, 16, buf);
 
@@ -340,11 +342,12 @@ static void zone_enter_pid(ZoneCtrl *z, float seed_temp_c)
 {
     pid_temp = seed_temp_c;
     PID_Init(&z->pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, seed_temp_c);
-    z->pid.out_min = 0.0f;        /* ← fan range */
-    z->pid.out_max = 1.0f;        /* ← */
-    z->fault_count   = 0;
-    z->recover_count = 0;
-    z->state         = ST_PID;
+    z->pid.out_min = 0.0f;        /* fan range */
+    z->pid.out_max = 1.0f;
+    z->fault_count    = 0;
+    z->recover_count  = 0;
+    z->throttle_count = 0;
+    z->state          = ST_PID;
 }
 
 static void zone_enter_fault(ZoneCtrl *z, FaultReason r)
@@ -375,7 +378,7 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
         }
         break;
 
-    case ST_PID:   /* RUNNING */
+    case ST_PID:   /* RUNNING (Tier 1 fan PID + Tier 2 throttle) */
         if (fault_candidate != FR_NONE) {
             z->fault_count++;
             if (z->fault_count >= FAULT_TRIP_N) {
@@ -390,11 +393,38 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
             zone_enter_cooldown(z);
             break;
         }
-        /* fan PID (heater untouched - it's the user's open-loop load) */
+
+        /* ── Tier 1: fan PID (heater is the user's open-loop load) ──────── */
         z->duty_cmd = PID_Update(&z->pid, z->setpoint_c, ema_t_c);
-        if (z->duty_cmd < 0.0f) z->duty_cmd = 0.0f;   /* fan can't go negative */
+        if (z->duty_cmd < 0.0f) z->duty_cmd = 0.0f;
         if (z->duty_cmd > 1.0f) z->duty_cmd = 1.0f;
         g_fan_duty = z->duty_cmd;
+
+        /* ── Tier 2: thermal throttling (override) — AFTER the fan PID ────
+         * Fan saturated + still hot = cooling authority exhausted -> cut
+         * the chip load. Asymmetric (fast cut, slow restore) with a
+         * fan-headroom deadband so it doesn't hunt. throttle_count is a
+         * one-time ENGAGE delay (fair chance for the fan first). */
+        {
+            uint8_t fan_saturated = (g_fan_duty >= THROTTLE_FAN_SAT);
+            uint8_t still_hot     = (ema_t_c > z->setpoint_c + THROTTLE_MARGIN_C);
+
+            if (fan_saturated && still_hot) {
+                z->throttle_count++;
+                if (z->throttle_count >= THROTTLE_ENGAGE_N)
+                    g_heater_duty -= THROTTLE_CUT_STEP;       /* fast cut, every tick */
+                	z->WASTHROTTELED = 1;
+            } else if((g_heater_duty<g_heater_request)&&(z->WASTHROTTELED)){
+                z->throttle_count = 0;
+                if (g_fan_duty < THROTTLE_FAN_HEADROOM)        /* deadband */
+                    g_heater_duty += THROTTLE_RESTORE_STEP;    /* slow restore */
+            }
+            else if (!(z->WASTHROTTELED))
+            		g_heater_duty = g_heater_request;
+
+            if (g_heater_duty < 0.0f)        g_heater_duty = 0.0f;
+            if (g_heater_duty > HEATER_MAX)  g_heater_duty = HEATER_MAX;
+        }
         break;
 
     case ST_COOLING:   /* COOLDOWN */
@@ -468,13 +498,14 @@ static void ControlTask(void const *argument)
 
             Zone_Tick(&zone1, vnode, temp_c, pid_temp);
 
-            /* Hard safety backstop: too hot -> kill chip, fan full */
+            /* Tier 3 hard safety backstop: over-temp -> kill chip, fan full */
             if (temp_c > MAX_SAFE_TEMP_C) {
                 g_heater_duty = 0.0f;
                 g_fan_duty    = 1.0f;
             }
 
-            log_sample(temp_c, pid_temp, vnode, g_fan_duty, g_heater_duty, zone1.setpoint_c);
+            log_sample(temp_c, pid_temp, vnode, g_fan_duty, g_heater_duty,
+                       zone1.setpoint_c);
             emit_change_events(&zone1);
 
             pwm_update();
@@ -573,15 +604,16 @@ void ThermalApp_Init(void)
     pid_temp = init_temp;
 
     PID_Init(&zone1.pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, init_temp);
-    zone1.state         = ST_IDLE;
-    zone1.fault_reason  = FR_NONE;
-    zone1.fault_count   = 0;
-    zone1.recover_count = 0;
-    zone1.cool_ticks    = 0;
+    zone1.state          = ST_IDLE;
+    zone1.fault_reason   = FR_NONE;
+    zone1.fault_count    = 0;
+    zone1.recover_count  = 0;
+    zone1.cool_ticks     = 0;
+    zone1.throttle_count = 0;
 
     ssd1306_clear();
     ssd1306_print(0, 0,  "CHIP COOLER");
-    ssd1306_print(0, 16, "V2.0 RTOS");
+    ssd1306_print(0, 16, "V3.0 MODE-C");
     ssd1306_update();
     HAL_Delay(800);
 }

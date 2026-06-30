@@ -42,8 +42,8 @@
 /* ============================================================================
  * PID GAINS (SIMC from measured plant: K~17, tau~111, theta~10)
  * ========================================================================== */
-#define PID_KP                	−0.68
-#define PID_KI                −0.0061
+#define PID_KP                	-0.68
+#define PID_KI                -0.0061
 #define PID_KD                0.0f
 #define PID_TS                1.0f      /* tick period (s)                    */
 #define PID_TAU_F             10.0f     /* derivative filter time const       */
@@ -105,6 +105,13 @@ typedef enum {
 #define COOL_THRESH_C            35.0f
 #define COOLING_TIMEOUT_TICKS    400    /* ~6.5 min at 1 Hz (3 * tau_eff)     */
 
+#define THROTTLE_FAN_SAT       0.98f   /* fan "saturated" above this    */
+#define THROTTLE_FAN_HEADROOM  0.80f   /* restore allowed below (deadband) */
+#define THROTTLE_MARGIN_C      0.3f    /* temp must exceed setpoint by this */
+#define THROTTLE_ENGAGE_N      5       /* ticks saturated+hot before throttling */
+#define THROTTLE_CUT_STEP      0.02f   /* fast cut per tick             */
+#define THROTTLE_RESTORE_STEP  0.005f  /* slow restore per tick (4x gentler) */
+#define HEATER_MAX             1.0f    /* restore ceiling               */
 /* ============================================================================
  * ZoneCtrl - the unit of replication
  *   One instance per physical zone. All per-zone state lives here so:
@@ -117,8 +124,11 @@ typedef struct {
     ThermalState    state;
     FaultReason     fault_reason;    /* committed fault (latched until recover)*/
     uint8_t         fault_count;     /* debounce: ticks signal looked faulty  */
+    uint8_t         WASTHROTTELED;
     uint8_t         recover_count;   /* debounce: ticks signal looked sane    */
     uint16_t        cool_ticks;      /* COOLING timeout counter               */
+    uint16_t 		throttle_count;
+
 
     /* Command flags - written by UI/comms, consumed by FSM.
      * volatile: writes can come from any context (ISR, debugger, task).      */
@@ -131,6 +141,7 @@ typedef struct {
     float           setpoint_c;
     float           duty_cmd;        /* PID output [-1..+1], mirrored global  */
     float           fan_cmd;        /* PID output [-1..+1], mirrored global  */
+
 
 } ZoneCtrl;
 
