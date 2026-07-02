@@ -2,25 +2,20 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Thermal Logger main - STM32F4
-  *
-  * Derived from DSP Lab oscilloscope main.c (v3).
-  * All oscilloscope-specific user code has been removed and replaced with
-  * the thermal logger application as described in main_thermal_patch.c.
+  * @brief          : Chip-cooling thermal controller - STM32F411CEU6 @ 24 MHz
   *
   * Peripheral usage:
-  *   ADC1  – PA0 (IN0), 12-bit, polling (no DMA)
-  *   TIM3  – CH1 / PA6, PWM @ 1 kHz, duty driven by ThermalApp
-  *   I2C1  – SSD1306 OLED display
+  *   ADC1   – PA0 (IN0), 12-bit, polled, oversample x128 (NTC divider)
+  *   TIM2   – 1 Hz control tick -> ThermalApp_TickISR() -> xCtrlQueue
+  *   TIM3   – CH1 heater PWM @ 1 kHz
+  *   TIM5   – CH2 fan PWM @ 24 kHz (4-wire fan control line)
+  *   TIM11  – HAL 1 ms timebase (SysTick belongs to FreeRTOS)
+  *   I2C1   – SSD1306 OLED @ 400 kHz
   *   USART2 – retained from CubeMX project; not used by thermal app
   *
-  * Removed vs oscilloscope version:
-  *   - TIM2  (ADC trigger timer)
-  *   - SPI2  (ESP32 data link)
-  *   - DMA   (was SPI2 TX only)
-  *   - All oscilloscope private variables, filters, FFT, measurement code
-  *   - HAL_ADC_ConvCpltCallback, HAL_SPI_TxCpltCallback,
-  *     HAL_UART_RxCpltCallback
+  * NOTE: TIM2/TIM11 dispatch lives inside the CubeMX-generated
+  *       HAL_TIM_PeriodElapsedCallback below, in USER CODE Callback 1 —
+  *       do NOT re-add a second definition in USER CODE 4 (regen-proof).
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -31,9 +26,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ssd1306.h"
-#include "ring_buf.h"
 #include "thermal_app.h"
 #include "cyc.h"
+#include "FreeRTOS.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -146,6 +141,8 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
+  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
 
@@ -557,26 +554,11 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM11) {     /* HAL's 1 ms heartbeat */
-        HAL_IncTick();
-    }
-    else if (htim->Instance == TIM2) { /* our 1 Hz control tick */
-
-        ThermalApp_TickISR();
-    }
-}
 /*
- * No application-level HAL callbacks are required by the thermal logger.
- *
- * ThermalApp_Loop() uses blocking HAL_ADC_Start / HAL_ADC_PollForConversion
- * and HAL_TIM_PWM_Start, so neither the ADC conversion-complete interrupt
- * nor any SPI/UART receive interrupt is needed.
- *
- * If you later add UART command input (e.g. to set g_duty_cmd remotely),
- * add HAL_UART_RxCpltCallback here and call HAL_UART_Receive_IT() after
- * MX_USART2_UART_Init() in USER CODE BEGIN 2.
+ * NOTE: HAL_TIM_PeriodElapsedCallback intentionally NOT defined here.
+ * The single dispatcher lives in the CubeMX-generated callback below;
+ * our TIM2 branch is inside its USER CODE Callback 1 section so it
+ * survives code regeneration. A second definition here = link error.
  */
 /* USER CODE END 4 */
 
@@ -593,7 +575,8 @@ void StartDefaultTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-	  osDelay(1);  }
+    osDelay(1);
+  }
   /* USER CODE END 5 */
 }
 
@@ -605,7 +588,20 @@ void StartDefaultTask(void const * argument)
   * @param  htim : TIM handle
   * @retval None
   */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
 
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM11) {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+  else if (htim->Instance == TIM2) {   /* 1 Hz control tick -> queue event */
+    ThermalApp_TickISR();
+  }
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
