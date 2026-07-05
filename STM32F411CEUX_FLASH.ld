@@ -44,8 +44,7 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 /* Memories definition */
 MEMORY
 {
-  RAM        (xrw) : ORIGIN = 0x20000000, LENGTH = 80K
-  RAM_NOINIT (xrw) : ORIGIN = 0x20014000, LENGTH = 48K
+  RAM        (xrw) : ORIGIN = 0x20000000, LENGTH = 128K
   FLASH      (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
 }
 
@@ -166,15 +165,7 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
   
-    /* Black-box log: lives in RAM_NOINIT, survives reset.
-     NOLOAD: no flash backing. KEEP: don't garbage-collect. */
-  .noinit (NOLOAD) :
-  {
-    . = ALIGN(4);
-    KEEP(*(.noinit))
-    KEEP(*(.noinit*))
-    . = ALIGN(4);
-  } >RAM_NOINIT
+
 
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */
   ._user_heap_stack :
