@@ -348,8 +348,8 @@ static void zone_enter_throttle(ZoneCtrl *z)
  PID_TS, PID_TAU_F, pid_temp);
     z->pid_throttle.out_min  = 0.0f;
     z->pid_throttle.out_max  = HEATER_MAX;
-    z->pid_throttle.integral = g_heater_duty;   /* the bumpless seed */
-
+    z->pid_throttle.integral = g_heater_duty
+                             - THROTTLE_PID_KP * (z->setpoint_c - pid_temp);
     z->state = ST_THROTTLE;
 }
 static void zone_enter_fault(ZoneCtrl *z, FaultReason r)
