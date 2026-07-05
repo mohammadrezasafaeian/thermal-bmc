@@ -4,7 +4,7 @@ parse_struct_dump.py - STM32 chip-cooling controller: story-driven analysis.
 
 Figures:
   <stem>_overview.png     The whole run: temp, request-vs-granted load, fan.
-  <stem>_mechanism.png    One throttle cycle, annotated step by step.
+  <stem>_mechanism.png    One throttle cycle, annotated step by step (arrows).
   <stem>_detail.png       FSM with live counts + per-fault zoom panels.
   <stem>_walkthrough.png  Glossary + transition chips + timeline strip.
 Data:
@@ -12,7 +12,11 @@ Data:
   <stem>_events.csv       Decoded event stream.
 
 Usage:
-  python parse_struct_dump.py run1.txt --events run1_events.txt -o run1
+  python parse_struct_dump.py run1.txt --events run1_events.txt ^
+         --marks run1_marks.txt -o run1 --trange 27.5 37.5
+Marks file: time,label[,color] per line, e.g.
+  563,FAN MOVED AWAY,#d97706
+  698,FAN RESTORED,#15803d
 """
 
 import argparse
@@ -119,6 +123,21 @@ def parse_events_from_expressions(text):
     return arr[np.argsort(arr['time_s'])]
 
 
+def load_marks(path):
+    marks = []
+    if not path:
+        return marks
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.strip().split(",")]
+            if len(parts) >= 2:
+                marks.append((float(parts[0]), parts[1],
+                              parts[2] if len(parts) > 2 else C_INK_SOFT))
+    return marks
+
+
 def col(data, fields, name):
     return data[:, fields.index(name)] if name in fields else None
 
@@ -160,13 +179,6 @@ def fault_windows(events):
     return wins
 
 
-def setpoint_series(events, t, default=None):
-    """Setpoint as a per-sample series (uses log column if present)."""
-    if default is not None:
-        return default
-    return None
-
-
 def mask_invalid_temps(x, t, events):
     if x is None:
         return None
@@ -178,9 +190,8 @@ def mask_invalid_temps(x, t, events):
 
 
 def infer_request(t, heater, intervals):
-    """Reconstruct g_heater_request (not logged): equals heater_duty in
-    ST_PID; forward-filled through THROTTLE; NaN when outputs are forced
-    off (IDLE/COOLING/FAULT)."""
+    """g_heater_request isn't logged: equals heater_duty in ST_PID;
+    forward-filled through THROTTLE; NaN elsewhere."""
     if heater is None or not intervals:
         return None
     req = np.full_like(heater, np.nan)
@@ -196,7 +207,6 @@ def infer_request(t, heater, intervals):
 
 
 def throttle_cycles(intervals):
-    """[(t_enter, t_exit, prev_state, next_state), ...] for THROTTLE dwells."""
     out = []
     for i, (t0, t1, st) in enumerate(intervals):
         if STATE_NAMES.get(st) != 'THROTTLE':
@@ -209,7 +219,6 @@ def throttle_cycles(intervals):
 
 
 def handover_delta(t, heater, t_enter):
-    """heater_duty step across the PID->THROTTLE boundary (seed check)."""
     before = heater[(t < t_enter)][-1:]
     after = heater[(t >= t_enter)][:1]
     if len(before) and len(after):
@@ -290,10 +299,25 @@ def state_strip(ax, intervals, t_end, label_min_frac=0.05):
                     fontweight='bold', color='white')
 
 
+def draw_marks(marks, label_ax, line_axes, t_lo=None, t_hi=None):
+    for (tm, lbl, mc) in (marks or []):
+        if t_lo is not None and not (t_lo <= tm <= t_hi):
+            continue
+        for ax in line_axes:
+            ax.axvline(tm, color=mc, lw=1.1, ls='--', alpha=0.8, zorder=6)
+        label_ax.annotate(lbl, xy=(tm, 0.99),
+                          xycoords=('data', 'axes fraction'),
+                          ha='center', va='top', fontsize=7.5, color=mc,
+                          fontweight='bold',
+                          bbox=dict(boxstyle='round,pad=0.25', fc='white',
+                                    ec=mc, lw=0.8, alpha=0.95), zorder=11)
+
+
 # =============================================================================
-# FIGURE 1 - OVERVIEW ("what happened")
+# FIGURE 1 - OVERVIEW
 # =============================================================================
-def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
+def make_overview_plot(data, fields, events, png_path, show,
+                       title_suffix="", marks=None, trange=None):
     apply_style()
     t = col(data, fields, "time_s")
     t_end = float(t[-1])
@@ -319,7 +343,6 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
                "Fan PID holds temperature; when cooling authority runs out, "
                "a second PID overrides the requested load", title_suffix)
 
-    # --- temperature ---
     shade_states(ax_temp, intervals)
     if temp_raw is not None:
         ax_temp.plot(t, temp_raw, lw=0.7, color=C_TEMP_RAW,
@@ -327,6 +350,7 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
     if temp_ema is not None:
         ax_temp.plot(t, temp_ema, lw=1.9, color=C_TEMP_EMA,
                      label='temp (EMA, loop input)')
+    sp = None
     if setp is not None:
         sp = setp.copy(); sp[sp <= 0] = np.nan
         ax_temp.step(t, sp, where='post', lw=1.3, ls='--',
@@ -334,17 +358,19 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
     ax_temp.set_ylabel("Temp (°C)")
     ax_temp.grid(True, axis='y')
     ax_temp.legend(loc='lower right', ncol=3, bbox_to_anchor=(1.0, 1.0))
-    fin = [a[np.isfinite(a)] for a in (temp_raw, temp_ema)
-           if a is not None and np.isfinite(a).any()]
-    if fin:
-        allv = np.concatenate(fin)
-        lo, hi = np.nanpercentile(allv, 1), np.nanpercentile(allv, 99)
-        if setp is not None and np.isfinite(sp).any():
-            lo, hi = min(lo, np.nanmin(sp)), max(hi, np.nanmax(sp))
-        span = max(hi - lo, 1.0)
-        ax_temp.set_ylim(lo - 0.12 * span, hi + 0.22 * span)
+    if trange:
+        ax_temp.set_ylim(*trange)
+    else:
+        fin = [a[np.isfinite(a)] for a in (temp_raw, temp_ema)
+               if a is not None and np.isfinite(a).any()]
+        if fin:
+            allv = np.concatenate(fin)
+            lo, hi = np.nanpercentile(allv, 1), np.nanpercentile(allv, 99)
+            if sp is not None and np.isfinite(sp).any():
+                lo, hi = min(lo, np.nanmin(sp)), max(hi, np.nanmax(sp))
+            span = max(hi - lo, 1.0)
+            ax_temp.set_ylim(lo - 0.12 * span, hi + 0.22 * span)
 
-    # --- load: request vs granted, denied hatched ---
     shade_states(ax_load, intervals)
     if heater is not None:
         ax_load.fill_between(t, 0, heater, color=C_HEATER, alpha=0.40,
@@ -364,7 +390,6 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
     ax_load.legend(loc='upper left', ncol=3, fontsize=8,
                    bbox_to_anchor=(0.0, 1.28))
 
-    # --- fan ---
     shade_states(ax_fan, intervals)
     if fan is not None:
         ax_fan.plot(t, fan, lw=1.5, color=C_FAN, label='fan (control output)')
@@ -377,13 +402,14 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
     ax_fan.grid(True, axis='y')
     ax_fan.legend(loc='upper left', fontsize=8)
 
-    # --- strip ---
     state_strip(ax_strip, intervals, t_end)
     ax_strip.set_xlabel("Time (s)   /   total run: {}:{:02d}".format(
         int(t_end) // 60, int(t_end) % 60))
 
     for ax in (ax_temp, ax_load, ax_fan):
         plt.setp(ax.get_xticklabels(), visible=False)
+
+    draw_marks(marks, ax_temp, (ax_temp, ax_load, ax_fan))
 
     fig.savefig(png_path, dpi=160, bbox_inches='tight', facecolor=C_BG)
     print("[png] wrote {}".format(png_path), file=sys.stderr)
@@ -393,10 +419,10 @@ def make_overview_plot(data, fields, events, png_path, show, title_suffix=""):
 
 
 # =============================================================================
-# FIGURE 2 - MECHANISM ("how throttling works"), one annotated cycle
+# FIGURE 2 - MECHANISM: one throttle cycle, arrow-annotated story
 # =============================================================================
 def make_mechanism_plot(data, fields, events, png_path, show,
-                        title_suffix=""):
+                        title_suffix="", marks=None):
     apply_style()
     t = col(data, fields, "time_s")
     t_end = float(t[-1])
@@ -408,22 +434,28 @@ def make_mechanism_plot(data, fields, events, png_path, show,
     request = infer_request(t, heater, intervals)
     cycles = throttle_cycles(intervals)
     if not cycles:
-        print("[mechanism] no THROTTLE interval in this run, skipping",
-              file=sys.stderr)
+        print("[mechanism] no THROTTLE interval, skipping", file=sys.stderr)
         return
 
-    # pick the longest complete cycle (prefer ones that exit back to PID)
+    # ---- cycle selection: prefer the cycle your marks bracket ----
     complete = [c for c in cycles if c[3] == 'PID'] or cycles
-    t_in, t_out, _, next_st = max(complete, key=lambda c: c[1] - c[0])
-    pre, post = min(60.0, t_in * 0.9), 60.0
-    w = (t >= t_in - pre) & (t <= min(t_out + post, t_end))
-    tw = t[w]
 
+    def mark_score(c):
+        return sum(1 for (tm, _, _) in (marks or [])
+                   if c[0] - 90.0 <= tm <= c[1] + 90.0)
+
+    t_in, t_out, _, next_st = max(
+        complete, key=lambda c: (mark_score(c), c[1] - c[0]))
+    pre = min(90.0, max(30.0, t_in * 0.9))
+    post = min(90.0, t_end - t_out)
+    w = (t >= t_in - pre) & (t <= t_out + post)
+    tw = t[w]
+    t_lo, t_hi = float(tw[0]), float(tw[-1])
     dv = handover_delta(t, heater, t_in)
 
-    fig = plt.figure(figsize=(13.5, 7.6), facecolor=C_BG)
-    gs = fig.add_gridspec(4, 1, height_ratios=[0.55, 1.9, 1.6, 1.6],
-                          hspace=0.32, left=0.07, right=0.97,
+    fig = plt.figure(figsize=(13.5, 7.8), facecolor=C_BG)
+    gs = fig.add_gridspec(4, 1, height_ratios=[0.55, 1.9, 1.5, 1.7],
+                          hspace=0.34, left=0.07, right=0.97,
                           top=0.95, bottom=0.07)
     ax_title = fig.add_subplot(gs[0])
     ax_t = fig.add_subplot(gs[1])
@@ -431,8 +463,8 @@ def make_mechanism_plot(data, fields, events, png_path, show,
     ax_h = fig.add_subplot(gs[3], sharex=ax_t)
 
     draw_title(ax_title, "Throttle Mechanism - one cycle, step by step",
-               "The heater simulates chip load. The controller ignores the "
-               "user's request only while it is physically unsustainable.",
+               "The controller reacts to the *effect* (no cooling headroom), "
+               "never the cause - fan degraded, blocked, or load too high.",
                title_suffix)
 
     for ax in (ax_t, ax_f, ax_h):
@@ -441,13 +473,14 @@ def make_mechanism_plot(data, fields, events, png_path, show,
                    alpha=0.28, zorder=0)
         ax.axvline(t_in, color=C_BADGE_ED, lw=1.2)
         ax.axvline(t_out, color=C_PID, lw=1.2, ls='-.')
-        ax.set_xlim(tw[0], tw[-1])
+        ax.set_xlim(t_lo, t_hi)
         ax.grid(True, axis='y')
 
     # (1) temperature + margin band
     if temp_ema is not None:
         ax_t.plot(tw, temp_ema[w], lw=1.8, color=C_TEMP_EMA,
                   label='temp (EMA)')
+    spw = None
     if setp is not None:
         spw = setp[w].copy(); spw[spw <= 0] = np.nan
         ax_t.step(tw, spw, where='post', lw=1.2, ls='--', color=C_SETPOINT,
@@ -466,11 +499,12 @@ def make_mechanism_plot(data, fields, events, png_path, show,
     ax_f.set_ylim(-0.05, 1.12)
     ax_f.set_ylabel("Fan [0..1]")
 
-    # (3) heater: request vs granted
+    # (3) heater: request vs granted -- Y AXIS ZOOMED TO WINDOW DATA
     if heater is not None:
         ax_h.fill_between(tw, 0, heater[w], color=C_HEATER, alpha=0.40)
         ax_h.plot(tw, heater[w], lw=1.2, color=C_HEATER,
                   label='granted load')
+    rw = None
     if request is not None:
         rw = request[w]
         ax_h.plot(tw, rw, lw=1.4, ls=':', color=C_REQUEST,
@@ -479,36 +513,84 @@ def make_mechanism_plot(data, fields, events, png_path, show,
         ax_h.fill_between(tw, heater[w], rw, where=denied,
                           facecolor='none', edgecolor=C_DENIED,
                           hatch='///', lw=0.0, alpha=0.85, label='denied')
-    ax_h.set_ylim(-0.05, 1.12)
-    ax_h.set_ylabel("Load [0..1]")
+    duty_vals = [heater[w]] if heater is not None else []
+    if rw is not None:
+        duty_vals.append(rw[np.isfinite(rw)])
+    if duty_vals:
+        av = np.concatenate([v[np.isfinite(v)] for v in duty_vals])
+        if len(av):
+            dlo, dhi = float(av.min()), float(av.max())
+            pad = max(0.15 * (dhi - dlo), 0.02)
+            ax_h.set_ylim(max(-0.02, dlo - pad), dhi + pad * 2.5)
+    ax_h.set_ylabel("Load (zoomed)")
     ax_h.set_xlabel("Time (s)")
     ax_h.legend(loc='upper right', ncol=3, fontsize=8)
 
-    # ---- numbered step callouts ----
-    def step(ax, x, yfrac, num, text, color=C_INK):
+    # ---- arrow-anchored story callouts ----
+    def callout(ax, num, text, xy, xytext_frac, color=C_BADGE_ED):
         ax.annotate(
-            "{} {}".format(num, text),
-            xy=(x, yfrac), xycoords=('data', 'axes fraction'),
-            ha='center', va='top', fontsize=8, color=color,
+            "{}  {}".format(num, text), xy=xy, xycoords='data',
+            xytext=xytext_frac, textcoords='axes fraction',
+            ha='center', va='top', fontsize=7.8, color=C_INK,
             fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.3', fc=C_BADGE_BG,
-                      ec=C_BADGE_ED, lw=0.9, alpha=0.97), zorder=11)
+                      ec=color, lw=1.0, alpha=0.97),
+            arrowprops=dict(arrowstyle='->', color=color, lw=1.2,
+                            shrinkA=2, shrinkB=3),
+            zorder=12)
 
-    step(ax_f, t_in - pre * 0.45, 0.55, "1",
-         "fan hits 100% -\ncooling authority exhausted")
-    step(ax_t, t_in - pre * 0.45, 0.92, "2",
-         "temp stuck above\nsetpoint + margin")
-    step(ax_h, t_in, 0.97, "3",
-         "5 s debounce, then heater\nhanded to throttle PID",
-         color=C_BADGE_ED)
-    if dv is not None:
-        step(ax_h, (t_in + t_out) / 2, 0.60, "4",
-             "bumpless handover: step = {:+.3f} duty\n"
-             "load capped at sustainable max".format(dv))
+    def interp(arr, tv):
+        if arr is None:
+            return 0.0
+        aw = arr[w]
+        m = np.isfinite(aw)
+        return float(np.interp(tv, tw[m], aw[m])) if m.any() else 0.0
+
+    xf = lambda tv: (tv - t_lo) / (t_hi - t_lo)   # time -> axes fraction
+
+    # 1: fan reaches max (first railed sample before entry)
+    fw = fan[w]
+    railed = tw[(fw >= 0.999) & (tw <= t_in)]
+    t_sat = float(railed[0]) if len(railed) else t_in - 2.0
+    callout(ax_f, "1", "fan hits 100% - cooling authority\nexhausted, "
+            "whatever the cause", (t_sat, 1.0),
+            (max(0.13, xf(t_sat) - 0.13), 0.55), color=C_FAN)
+
+    # 2: temp stuck above setpoint+margin
+    callout(ax_t, "2", "temp stuck above\nsetpoint + margin",
+            (t_in - 2.0, interp(temp_ema, t_in - 2.0)),
+            (max(0.10, xf(t_in) - 0.22), 0.30), color=C_FAULT)
+
+    # 3: handover at entry
+    step_txt = "handover to throttle PID\nstep = {:+.3f} duty".format(dv) \
+        if dv is not None else "handover to throttle PID"
+    callout(ax_h, "3", step_txt,
+            (t_in + 1.0, interp(heater, t_in + 1.0)),
+            (min(0.85, xf(t_in) + 0.14), 0.97))
+
+    # 4: throttle PID walks the load
+    t_mid = (t_in + t_out) / 2.0
+    callout(ax_h, "4", "user request DENIED (hatched);\nPID tracks the "
+            "sustainable max", (t_mid, interp(heater, t_mid)),
+            (xf(t_mid), 0.30), color=C_DENIED)
+
+    # 5: recovery mark (e.g. fan restored) -> temp falls
+    rec = [(tm, lbl) for (tm, lbl, _) in (marks or [])
+           if t_in < tm < t_out]
+    if rec:
+        t_rec = rec[-1][0]
+        callout(ax_t, "5", "cooling recovers ->\ntemp falls toward setpoint",
+                (t_rec + 5.0, interp(temp_ema, t_rec + 5.0)),
+                (min(0.88, xf(t_rec) + 0.13), 0.92), color=C_PID)
+
+    # 6: exit back to PID
     if next_st == 'PID':
-        step(ax_h, t_out + post * 0.4, 0.97, "5",
-             "exit: request sustainable\nagain -> user back in control",
-             color=C_PID)
+        callout(ax_h, "6", "throttle output climbs to request ->\n"
+                "exit, user regains control",
+                (t_out, interp(heater, min(t_out + 2.0, t_hi))),
+                (min(0.88, xf(t_out) + 0.10), 0.62), color=C_PID)
+
+    draw_marks(marks, ax_t, (ax_t, ax_f, ax_h), t_lo, t_hi)
 
     fig.savefig(png_path, dpi=160, bbox_inches='tight', facecolor=C_BG)
     print("[png] wrote {}".format(png_path), file=sys.stderr)
@@ -566,7 +648,6 @@ def draw_fsm(ax, events=None, counts=True):
     for src, dst, label, (lx, ly), rad in FSM_EDGES:
         x0, y0 = FSM_NODES[src]; x1, y1 = FSM_NODES[dst]
         n = trans.get((NAME_TO_ID[src], NAME_TO_ID[dst]), 0)
-        active = (not counts) or n > 0
         ax.add_patch(FancyArrowPatch(
             (x0, y0), (x1, y1),
             connectionstyle="arc3,rad={}".format(rad),
@@ -679,7 +760,7 @@ def make_detail_plot(data, fields, events, png_path, show, title_suffix=""):
 
 
 # =============================================================================
-# FIGURE 4 - WALKTHROUGH (glossary + transition chips + strip)
+# FIGURE 4 - WALKTHROUGH
 # =============================================================================
 def draw_state_glossary(ax):
     ax.set_xlim(0, 10); ax.set_ylim(0, 1); ax.axis('off')
@@ -762,7 +843,7 @@ def select_walkthrough_pivots(events, max_insets=7):
     if len(pivots) <= max_insets:
         return pivots
     chosen, seen = [], set()
-    for p in pivots:                       # 1st occurrence of each type
+    for p in pivots:
         key = ('sp',) if p['kind'] == 'setpoint' else (p['from'], p['to'])
         if key not in seen:
             seen.add(key); chosen.append(p)
@@ -857,7 +938,6 @@ def print_report(data, fields, events):
         c = col(data, fields, name)
         print("  {:<12} min={:>9.2f}  max={:>9.2f}  mean={:>9.2f}".format(
             name, c.min(), c.max(), c.mean()))
-    # dwell summary
     dwell = {}
     for (t0, t1, st) in intervals:
         dwell[st] = dwell.get(st, 0.0) + (t1 - t0)
@@ -866,7 +946,6 @@ def print_report(data, fields, events):
         for st, d in sorted(dwell.items()):
             print("    {:<9} {:7.0f}s  ({:.0f}%)".format(
                 STATE_NAMES.get(st, '?'), d, 100.0 * d / t_end))
-    # mechanism metrics
     cycles = throttle_cycles(intervals)
     if cycles and heater is not None:
         print("\n  THROTTLE CYCLES")
@@ -971,6 +1050,9 @@ def main():
     ap.add_argument("--max-rows", type=int, default=300)
     ap.add_argument("--tmin", type=float)
     ap.add_argument("--tmax", type=float)
+    ap.add_argument("--marks", help="file: time,label[,color] per line")
+    ap.add_argument("--trange", type=float, nargs=2, metavar=('LO', 'HI'),
+                    help="fixed temperature y-range for overview")
     ap.add_argument("--title", default="")
     ap.add_argument("--no-plot", action="store_true")
     args = ap.parse_args()
@@ -988,6 +1070,7 @@ def main():
     if args.events:
         with open(args.events, encoding="utf-8", errors="replace") as f:
             events = parse_events_from_expressions(f.read())
+    marks = load_marks(args.marks)
 
     if args.tmin is not None or args.tmax is not None:
         t = data[:, fields.index("time_s")]
@@ -997,15 +1080,16 @@ def main():
         if events is not None:
             events = events[(events['time_s'] >= lo)
                             & (events['time_s'] <= hi)]
+        marks = [m for m in marks if lo <= m[0] <= hi]
 
     print_report(data, fields, events)
     stem = args.out_prefix or args.infile.rsplit(".", 1)[0]
     save_analysis_csvs(stem, data, fields, events, args.max_rows)
     show = not args.no_plot
     make_overview_plot(data, fields, events, stem + "_overview.png",
-                       show, args.title)
+                       show, args.title, marks, args.trange)
     make_mechanism_plot(data, fields, events, stem + "_mechanism.png",
-                        show, args.title)
+                        show, args.title, marks)
     make_detail_plot(data, fields, events, stem + "_detail.png",
                      show, args.title)
     make_walkthrough_plot(data, fields, events, stem + "_walkthrough.png",
