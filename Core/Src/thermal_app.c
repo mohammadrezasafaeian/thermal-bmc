@@ -50,7 +50,7 @@ extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim5;
 extern I2C_HandleTypeDef hi2c1;
-
+extern volatile uint32_t g_tach_pulses;
 /* ============================================================================
  * PUBLIC GLOBALS
  * ========================================================================== */
@@ -160,7 +160,7 @@ static void pwm_update(void)
  * LOGGING
  * ========================================================================== */
 static void log_sample(float temp_c, float temp_ema, float vnode,
-                       float fan, float heater, float setpoint)
+                       float fan, float heater, float heater_req, float setpoint, uint32_t fan_rpm)
 {
     uint32_t idx = thermal_log_idx % THERM_LOG_LEN;
     thermal_log[idx].time_s      = HAL_GetTick() * 0.001f;
@@ -169,7 +169,9 @@ static void log_sample(float temp_c, float temp_ema, float vnode,
     thermal_log[idx].vnode       = vnode;
     thermal_log[idx].fan_duty    = fan;
     thermal_log[idx].heater_duty = heater;
+    thermal_log[idx].heater_req  = heater_req;
     thermal_log[idx].setpoint    = setpoint;
+    thermal_log[idx].fan_rpm     = fan_rpm;
     thermal_log_idx++;
 }
 
@@ -295,10 +297,17 @@ static void oled_update(uint32_t adc_avg, float vnode, float rntc,
 /* ============================================================================
  * FSM HELPERS
  * ========================================================================== */
-static FaultReason detect_fault(float vnode)
-{
+/* Pass in the commanded duty and the measured RPM */
+static FaultReason detect_fault(float vnode, uint32_t fan_rpm){
+    /* 1. NTC hardware faults take priority */
     if (vnode > V_OPEN_THRESH)  return FR_NTC_OPEN;
     if (vnode < V_SHORT_THRESH) return FR_NTC_SHORT;
+
+    /* 2. Fan hardware fault */
+    if (fan_rpm < FAN_STALL_RPM) {
+        return FR_FAN_OPEN;
+    }
+
     return FR_NONE;
 }
 
@@ -365,10 +374,8 @@ static void zone_enter_fault(ZoneCtrl *z, FaultReason r)
 /* ============================================================================
  * Zone_Tick
  * ========================================================================== */
-void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
-{
-    FaultReason fault_candidate = detect_fault(vnode);
-
+void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c, uint32_t fan_rpm){
+	FaultReason fault_candidate = detect_fault(vnode, fan_rpm);
     switch (z->state) {
 
     case ST_IDLE:
@@ -451,17 +458,17 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
                 (g_heater_request   != z->mode_c_snap_request);
 
             /* Sustainable = throttle output has climbed back up to the user's
-             * request: the plant can hold setpoint at full requested load.
-             * Margin guards the case where request ≈ HEATER_MAX and the
-             * clamped output can only asymptote toward it. */
+             * request AND the temperature is no longer overheating. */
+            uint8_t recovered = (ema_t_c <= z->setpoint_c);
+
             uint8_t sustainable =
-                (g_heater_duty >= z->mode_c_snap_request - THROTTLE_EXIT_MARGIN);
+                (g_heater_duty >= z->mode_c_snap_request - THROTTLE_EXIT_MARGIN) && recovered;
 
             if (request_changed || sustainable) {
                 zone_enter_pid(z, ema_t_c);          /* clean re-entry        */
-                z->pid.integral = g_fan_duty;        /* your bumpless seed:   */
-                break;                               /* fan resumes from 1.0, */
-            }                                        /* not from a cliff      */
+                z->pid.integral = g_fan_duty;        /* bumpless seed reverse */
+                break;
+            }
         }
         break;
 
@@ -480,7 +487,13 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
             }
         }
         break;
-
+        /* TODO 2: Fan Fault Detection Logic
+         * Decide when to override fault_candidate with FR_FAN_OPEN.
+         * Hint 1: What happens if g_fan_duty is 0.0? Should RPM = 0 trigger a fault?
+         * Hint 2: The fan has physical inertia. When duty jumps from 0.0 to 1.0,
+         *         RPM is 0 for a fraction of a second. How does your existing
+         *         z->fault_count (which trips at FAULT_TRIP_N) protect you here?
+         */
     case ST_FAULT:
         g_heater_duty = 0.0f;
         z->fan_cmd    = 1.0f;
@@ -491,6 +504,7 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
                 z->fault_reason = FR_NONE;
                 zone_enter_cooldown(z);
             }
+
         } else {
             z->recover_count = 0;
         }
@@ -500,6 +514,7 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c)
         zone_enter_fault(z, FR_NONE);
         break;
     }
+
 }
 
 /* ============================================================================
@@ -534,7 +549,15 @@ static void ControlTask(void const *argument)
             if (zone1.state == ST_PID || zone1.state == ST_THROTTLE)
                 pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
 
-            Zone_Tick(&zone1, vnode, temp_c, pid_temp);
+            /* 1. Read and clear pulses (1 Hz window) */
+            uint32_t current_pulses = g_tach_pulses;
+            g_tach_pulses = 0;
+
+            /* TODO 3: Compute RPM */
+            uint32_t current_rpm = 0; /* Replace with your math: 2 pulses per rev, 1 sec window */
+            current_rpm = current_pulses*30;
+            /* Pass into Zone_Tick */
+            Zone_Tick(&zone1, vnode, temp_c, pid_temp, current_rpm);
 
             /* Tier 3 hard safety backstop */
             if (temp_c > MAX_SAFE_TEMP_C) {
@@ -543,7 +566,7 @@ static void ControlTask(void const *argument)
             }
 
             log_sample(temp_c, pid_temp, vnode, g_fan_duty, g_heater_duty,
-                       zone1.setpoint_c);
+                                   g_heater_request, zone1.setpoint_c, current_rpm);
             emit_change_events(&zone1);
 
             pwm_update();

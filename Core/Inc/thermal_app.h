@@ -113,7 +113,7 @@ typedef enum {
 #define THROTTLE_ENGAGE_N      5       /* ticks before Mode C engages        */
 #define HEATER_MAX             1.0f
 #define THROTTLE_EXIT_MARGIN   0.02f   /* duty headroom for Mode C exit      */
-
+#define FAN_STALL_RPM 300  /* Fault threshold: min speed is ~1200 RPM */
 /* ============================================================================
  * ZoneCtrl - the unit of replication
  * ========================================================================== */
@@ -162,7 +162,10 @@ typedef struct {
     float vnode;
     float fan_duty;
     float heater_duty;
+    float heater_req;
     float setpoint;
+    uint32_t fan_rpm;
+
 } ThermalLogEntry;
 
 typedef enum {
@@ -213,6 +216,5 @@ typedef enum {
 void ThermalApp_Init(void);
 void ThermalApp_StartTasks(void);
 void ThermalApp_TickISR(void);
-void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c);
-
+void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c, uint32_t fan_rpm);
 #endif /* INC_THERMAL_APP_H_ */
