@@ -2,17 +2,9 @@
  * thermal_app.c  --  Chip-cooling thermal controller (FreeRTOS)
  * Target : STM32F411CEU6 @ 24 MHz
  *
- * CONTROL TIERS
- *   Tier 1 (ST_PID)      : fan PID cools toward setpoint, heater = user load.
- *   Tier 2 (ST_THROTTLE) : fan pegged at 1.0, heater PID finds sustainable
- *                           load. Entered when fan authority exhausted.
- *   Tier 3 (hard backstop): over-temp -> kill heater, fan full.
- *
- * FSM:  IDLE --> PID --> THROTTLE <--> PID
- *                 |         |
- *               fault     fault
- *                 v         v
- *               FAULT --> COOLING --> IDLE
+ * PROJECT 2: DISTRIBUTED I2C BMC ARCHITECTURE
+ *   - Local STM32: Brains (RTOS, PID, UI, I2C Master)
+ *   - Remote ATmegas: Muscle (Sensors, PWM Actuators)
  * ========================================================================== */
 
 #include "thermal_app.h"
@@ -33,14 +25,18 @@
  * ========================================================================== */
 static QueueHandle_t     xCtrlQueue;
 static SemaphoreHandle_t xAdcMutex;
+SemaphoreHandle_t        xNodeMutex;
 
-static void ControlTask(void const *argument);
-static void UITask(void const *argument);
+static void ControlTask(void *argument);
+static void UITask(void *argument);
 static void BusTask(void *argument);
+
 static void emit_change_events(ZoneCtrl *z);
 static void zone_all_off(ZoneCtrl *z);
 static void zone_enter_cooldown(ZoneCtrl *z);
 static void zone_enter_throttle(ZoneCtrl *z);
+static void zone_enter_fault(ZoneCtrl *z, FaultReason r);
+static void zone_enter_pid(ZoneCtrl *z, float seed_temp_c);
 
 #define THERMAL_LOG_MAGIC  0xC0FFEE42u
 uint32_t thermal_log_magic;
@@ -51,41 +47,22 @@ extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim5;
 extern I2C_HandleTypeDef hi2c1;
-extern volatile uint32_t g_tach_pulses;
+
 /* ============================================================================
- * PUBLIC GLOBALS
+ * PUBLIC GLOBALS (DISTRIBUTED)
  * ========================================================================== */
 RemoteNode g_nodes[NUM_REMOTE_NODES];
-SemaphoreHandle_t xNodeMutex;
-ZoneCtrl zone1 = {
-    .name         = "Z1",
-    .state        = ST_IDLE,
-    .fault_reason = FR_NONE,
-    .setpoint_c   = 30.0f,
-    .fan_cmd      = 0.0f,
-};
-
-volatile float g_heater_duty    = 0.0f;
-volatile float g_heater_request = 0.2f;
-volatile float g_fan_duty       = 0.0f;
-volatile float g_setpoint_c     = 30.0f;
-
-PID_Handle pid;
+ZoneCtrl   zones[NUM_REMOTE_NODES];
 
 ThermalLogEntry thermal_log[THERM_LOG_LEN];
 ThermalEvent    thermal_events[THERM_EVENT_LEN];
 volatile uint32_t thermal_log_idx;
 volatile uint32_t thermal_event_idx;
 
-volatile uint32_t dbg_adc_avg = 0;
-volatile float    dbg_vnode   = 0.0f;
-volatile float    dbg_rntc    = 0.0f;
-volatile float    dbg_temp_c  = 0.0f;
-
 volatile Profiler g_prof = { .lat_min_us = 0xFFFFFFFFu };
 
 /* ============================================================================
- * PRIVATE STATE
+ * PRIVATE STATE (UI)
  * ========================================================================== */
 static float   plot_buf[THERM_PLOT_LEN];
 static uint8_t plot_head = 0;
@@ -95,37 +72,16 @@ static float   ema_mean         = 0.0f;
 static float   ema_dev          = 1.0f;
 static uint8_t ema_initialized  = 0;
 
-static float   pid_temp         = 0.0f;
-
 /* ============================================================================
- * SENSING HELPERS
+ * SENSING HELPERS (Adapted for 5V ATmega ADC over I2C)
  * ========================================================================== */
-static uint32_t adc_average(uint8_t n)
+static float adc_to_rntc_5v(float vnode)
 {
-    BaseType_t locked = (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED);
-    if (locked) xSemaphoreTake(xAdcMutex, portMAX_DELAY);
-
-    uint32_t sum = 0;
-    for (uint8_t i = 0; i < n; i++) {
-        HAL_ADC_Start(&hadc1);
-        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
-            sum += HAL_ADC_GetValue(&hadc1);
-        HAL_ADC_Stop(&hadc1);
-    }
-
-    uint32_t result = sum / n;
-    if (locked) xSemaphoreGive(xAdcMutex);
-    return result;
-}
-
-static float adc_to_rntc(uint32_t adc_val)
-{
-    float v = THERM_ADC_VREF * ((float)adc_val / 4095.0f);
-    if (v < 0.001f) v = 0.001f;
+    if (vnode < 0.001f) vnode = 0.001f;
     float v_max = THERM_DIV_VSUP - 0.001f;
-    if (v_max > (THERM_ADC_VREF - 0.001f)) v_max = THERM_ADC_VREF - 0.001f;
-    if (v > v_max) v = v_max;
-    float rntc = THERM_RTOP * (v / (THERM_DIV_VSUP - v));
+    if (vnode > v_max) vnode = v_max;
+
+    float rntc = THERM_RTOP * (vnode / (THERM_DIV_VSUP - vnode));
     if (rntc <    0.1f) rntc =    0.1f;
     if (rntc > 5000.0f) rntc = 5000.0f;
     return rntc;
@@ -145,22 +101,7 @@ static inline float ema_step(float state, float value, float alpha)
 }
 
 /* ============================================================================
- * PWM OUTPUT
- * ========================================================================== */
-static void pwm_update(void)
-{
-    float h = g_heater_duty;  if (h < 0.0f) h = 0.0f;  if (h > 1.0f) h = 1.0f;
-    float f = g_fan_duty;     if (f < 0.0f) f = 0.0f;  if (f > 1.0f) f = 1.0f;
-
-    uint32_t arr3 = __HAL_TIM_GET_AUTORELOAD(&htim3);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)(h * (float)arr3));
-
-    uint32_t arr5 = __HAL_TIM_GET_AUTORELOAD(&htim5);
-    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, (uint32_t)(f * (float)arr5));
-}
-
-/* ============================================================================
- * LOGGING
+ * LOGGING (Monitoring Node 0)
  * ========================================================================== */
 static void log_sample(float temp_c, float temp_ema, float vnode,
                        float fan, float heater, float heater_req, float setpoint, uint32_t fan_rpm)
@@ -191,6 +132,8 @@ static void event_log(EventKind kind, uint8_t u8, float f)
 
 static void emit_change_events(ZoneCtrl *z)
 {
+    /* To track multiple zones properly, these statics would need to be per-zone,
+     * but for the single-zone portoflio logger, we track Zone 0. */
     static uint8_t last_state        = 0xFF;
     static uint8_t last_fault_reason = 0xFF;
     static float   last_setpoint     = -1000.0f;
@@ -213,10 +156,320 @@ static void emit_change_events(ZoneCtrl *z)
 }
 
 /* ============================================================================
- * OLED RENDER
+ * FSM HELPERS (Fully Encapsulated)
  * ========================================================================== */
-static int format_fixed1(char *buf, int buf_len, float val)
+static FaultReason detect_fault(float vnode, uint32_t fan_rpm){
+    if (vnode > V_OPEN_THRESH)  return FR_NTC_OPEN;
+    if (vnode < V_SHORT_THRESH) return FR_NTC_SHORT;
+    if (fan_rpm < FAN_STALL_RPM) return FR_FAN_OPEN;
+    return FR_NONE;
+}
+
+static void zone_all_off(ZoneCtrl *z)
 {
+    z->fan_cmd     = 0.0f;
+    z->fan_duty    = 0.0f;
+    z->heater_duty = 0.0f;
+}
+
+static void zone_enter_cooldown(ZoneCtrl *z)
+{
+    z->cool_ticks  = 0;
+    z->heater_duty = 0.0f;
+    z->fan_cmd     = 1.0f;
+    z->fan_duty    = 1.0f;
+    z->state       = ST_COOLING;
+}
+
+static void zone_enter_pid(ZoneCtrl *z, float seed_temp_c)
+{
+    z->pid_temp = seed_temp_c;
+    PID_Init(&z->pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, seed_temp_c);
+    z->pid.out_min     = 0.0f;
+    z->pid.out_max     = 1.0f;
+    z->fault_count     = 0;
+    z->recover_count   = 0;
+    z->throttle_count  = 0;
+    z->heater_duty     = z->requested_heater_duty;
+    z->state           = ST_PID;
+}
+
+static void zone_enter_throttle(ZoneCtrl *z)
+{
+    /* Snapshot FSM Memory */
+    z->mode_c_snap_request  = z->requested_heater_duty;
+    z->mode_c_snap_setpoint = z->setpoint_c;
+
+    z->fan_cmd  = 1.0f;
+    z->fan_duty = 1.0f;
+
+    PID_Init(&z->pid_throttle, THROTTLE_PID_KP, THROTTLE_PID_KI, THROTTLE_PID_KD, PID_TS, PID_TAU_F, z->pid_temp);
+    z->pid_throttle.out_min  = 0.0f;
+    z->pid_throttle.out_max  = HEATER_MAX;
+
+    /* TRAP 3 FIXED: Seeded bumplessly from the plant's actual physical output at t-1 */
+    z->pid_throttle.integral = z->heater_duty - THROTTLE_PID_KP * (z->setpoint_c - z->pid_temp);
+    z->state = ST_THROTTLE;
+}
+
+static void zone_enter_fault(ZoneCtrl *z, FaultReason r)
+{
+    z->heater_duty   = 0.0f;
+    z->fan_cmd       = 1.0f;
+    z->fan_duty      = 1.0f;
+    z->fault_reason  = r;
+    z->recover_count = 0;
+    z->state         = ST_FAULT;
+}
+
+/* ============================================================================
+ * Zone_Tick (The Universal Engine)
+ * ========================================================================== */
+void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c, uint32_t fan_rpm){
+    FaultReason fault_candidate = detect_fault(vnode, fan_rpm);
+
+    switch (z->state) {
+
+    case ST_IDLE:
+        zone_all_off(z);
+        if (z->start_req) {
+            z->start_req = 0;
+            if (fault_candidate == FR_NONE) zone_enter_pid(z, raw_t_c);
+            else                            zone_enter_fault(z, fault_candidate);
+        }
+        break;
+
+    case ST_PID:
+        if (fault_candidate != FR_NONE) {
+            z->fault_count++;
+            if (z->fault_count >= FAULT_TRIP_N) {
+                zone_enter_fault(z, fault_candidate);
+                break;
+            }
+        } else {
+            z->fault_count = 0;
+        }
+
+        if (z->stop_req) {
+            z->stop_req = 0;
+            zone_enter_cooldown(z);
+            break;
+        }
+
+        /* Tier 1: fan PID */
+        z->fan_cmd = PID_Update(&z->pid, z->setpoint_c, ema_t_c);
+        if (z->fan_cmd < 0.0f) z->fan_cmd = 0.0f;
+        if (z->fan_cmd > 1.0f) z->fan_cmd = 1.0f;
+        z->fan_duty    = z->fan_cmd;
+        z->heater_duty = z->requested_heater_duty;
+
+        /* Tier 2: detect Mode C entry */
+        {
+            uint8_t fan_saturated = (z->fan_cmd > THROTTLE_FAN_SAT);
+            uint8_t still_hot     = (ema_t_c > z->setpoint_c + THROTTLE_MARGIN_C);
+
+            if (fan_saturated && still_hot) {
+                z->throttle_count++;
+                if (z->throttle_count >= THROTTLE_ENGAGE_N) {
+                    z->throttle_count = 0;
+                    zone_enter_throttle(z);
+                    break;
+                }
+            } else {
+                z->throttle_count = 0;
+            }
+        }
+        break;
+
+    case ST_THROTTLE:
+        if (fault_candidate != FR_NONE) {
+            z->fault_count++;
+            if (z->fault_count >= FAULT_TRIP_N) {
+                zone_enter_fault(z, fault_candidate);
+                break;
+            }
+        } else {
+            z->fault_count = 0;
+        }
+
+        if (z->stop_req) {
+            z->stop_req = 0;
+            zone_enter_cooldown(z);
+            break;
+        }
+
+        z->fan_duty = 1.0f;
+        z->heater_duty = PID_Update(&z->pid_throttle, z->setpoint_c, ema_t_c);
+
+        /* exit checks */
+        {
+            uint8_t request_changed =
+                (z->setpoint_c             != z->mode_c_snap_setpoint) ||
+                (z->requested_heater_duty  != z->mode_c_snap_request);
+
+            uint8_t recovered = (ema_t_c <= z->setpoint_c);
+            uint8_t sustainable = (z->heater_duty >= z->mode_c_snap_request - THROTTLE_EXIT_MARGIN) && recovered;
+
+            if (request_changed || sustainable) {
+                zone_enter_pid(z, ema_t_c);
+                z->pid.integral = z->fan_duty; /* bumpless reverse */
+                break;
+            }
+        }
+        break;
+
+    case ST_COOLING:
+        z->heater_duty = 0.0f;
+        z->fan_cmd     = 1.0f;
+        z->fan_duty    = 1.0f;
+        z->cool_ticks++;
+        {
+            uint8_t cool_now  = (raw_t_c < COOL_THRESH_C);
+            uint8_t sane      = (fault_candidate == FR_NONE);
+            uint8_t timed_out = (z->cool_ticks >= COOLING_TIMEOUT_TICKS);
+            if ((cool_now && sane) || timed_out) {
+                zone_all_off(z);
+                z->state = ST_IDLE;
+            }
+        }
+        break;
+
+    case ST_FAULT:
+        z->heater_duty = 0.0f;
+        z->fan_cmd     = 1.0f;
+        z->fan_duty    = 1.0f;
+        if (fault_candidate == FR_NONE) {
+            z->recover_count++;
+            if (z->recover_count >= FAULT_RECOVER_M) {
+                z->fault_reason = FR_NONE;
+                zone_enter_cooldown(z);
+            }
+        } else {
+            z->recover_count = 0;
+        }
+        break;
+
+    default:
+        zone_enter_fault(z, FR_NONE);
+        break;
+    }
+}
+
+/* ============================================================================
+ * CONTROL TASK (The Multi-Zone Brain)
+ * ========================================================================== */
+static void ControlTask(void *argument)
+{
+    (void)argument;
+    Event_t evt;
+
+    for (;;) {
+        if (xQueueReceive(xCtrlQueue, &evt, portMAX_DELAY) != pdPASS) continue;
+
+        if (evt == EVT_PID_TICK) {
+            uint32_t tc0 = DWT->CYCCNT;
+
+            for (int i = 0; i < NUM_REMOTE_NODES; i++) {
+
+                I2C_Telemetry tel;
+                uint8_t online;
+
+                /* 1: Safely lock, read shared memory, unlock */
+                xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+                tel = g_nodes[i].tel;
+                online = g_nodes[i].is_online;
+                xSemaphoreGive(xNodeMutex);
+
+                float vnode = 0.0f;
+                float temp_c = 0.0f;
+                uint32_t fan_rpm = 0;
+
+                if (online) {
+                    /* Convert 10-bit ATmega ADC to Voltage and Temp */
+                    vnode = 5.0f * ((float)tel.adc_raw / 1023.0f);
+                    temp_c = rntc_to_celsius(adc_to_rntc_5v(vnode));
+                    fan_rpm = tel.tach_pulses * 30;
+                }
+
+                /* Independent EMA calculation per zone */
+                if (zones[i].state == ST_PID || zones[i].state == ST_THROTTLE) {
+                    zones[i].pid_temp = zones[i].pid_temp + 0.02f * (temp_c - zones[i].pid_temp);
+                }
+
+                /* 2: FSM Execution */
+                if (!online) {
+                    zone_enter_fault(&zones[i], FR_NODE_OFFLINE);
+                } else {
+                    Zone_Tick(&zones[i], vnode, temp_c, zones[i].pid_temp, fan_rpm);
+                }
+
+                /* Tier 3 hard safety backstop (Per Zone) */
+                if (temp_c > MAX_SAFE_TEMP_C) {
+                    zones[i].heater_duty = 0.0f;
+                    zones[i].fan_duty    = 1.0f;
+                }
+
+                /* 3: Safely write commands back to the I2C buffer */
+                xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+                g_nodes[i].cmd.heater_pwm = (uint8_t)(zones[i].heater_duty * 255.0f);
+                g_nodes[i].cmd.fan_pwm    = (uint8_t)(zones[i].fan_duty * 255.0f);
+                xSemaphoreGive(xNodeMutex);
+
+                /* For portfolio logging, we capture Zone 0's data */
+                if (i == 0) {
+                    log_sample(temp_c, zones[i].pid_temp, vnode, zones[i].fan_duty,
+                               zones[i].heater_duty, zones[i].requested_heater_duty,
+                               zones[i].setpoint_c, fan_rpm);
+                    emit_change_events(&zones[i]);
+                }
+            }
+
+            g_prof.ctrl_us = CYC_TO_US(DWT->CYCCNT - tc0);
+        }
+        else if (evt == EVT_START_CMD) { zones[0].start_req = 1; }
+        else if (evt == EVT_STOP_CMD)  { zones[0].stop_req  = 1; }
+    }
+}
+
+/* ============================================================================
+ * BUS TASK (I2C Master)
+ * ========================================================================== */
+static void BusTask(void *argument)
+{
+    (void)argument;
+    const uint16_t node_addrs[NUM_REMOTE_NODES] = {0x20, 0x22, 0x24};
+
+    for(;;) {
+        for(int i = 0; i < NUM_REMOTE_NODES; i++) {
+            I2C_Telemetry temp_tel;
+            I2C_Command   temp_cmd;
+
+            xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+            temp_cmd = g_nodes[i].cmd;
+            xSemaphoreGive(xNodeMutex);
+
+            HAL_StatusTypeDef tx_stat = HAL_I2C_Master_Transmit(&hi2c1, node_addrs[i], (uint8_t*)&temp_cmd, sizeof(I2C_Command), 10);
+            HAL_StatusTypeDef rx_stat = HAL_I2C_Master_Receive(&hi2c1, node_addrs[i], (uint8_t*)&temp_tel, sizeof(I2C_Telemetry), 10);
+
+            if (tx_stat == HAL_OK && rx_stat == HAL_OK) {
+                xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+                g_nodes[i].tel = temp_tel;
+                g_nodes[i].is_online = 1;
+                xSemaphoreGive(xNodeMutex);
+            } else {
+                xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+                g_nodes[i].is_online = 0;
+                xSemaphoreGive(xNodeMutex);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+/* ============================================================================
+ * UI TASK (Now driven by Shared Memory)
+ * ========================================================================== */
+static int format_fixed1(char *buf, int buf_len, float val) {
     int sign = (val < 0.0f) ? 1 : 0;
     if (sign) val = -val;
     int32_t tenths = (int32_t)(val * 10.0f + 0.5f);
@@ -226,29 +479,22 @@ static int format_fixed1(char *buf, int buf_len, float val)
     else      return snprintf(buf, buf_len, "%ld.%ld",  (long)whole, (long)frac);
 }
 
-static void oled_update(uint32_t adc_avg, float vnode, float rntc,
-                        float temp_c, int heat_pct, int fan_pct)
-{
+static void oled_update(uint32_t adc_avg, float vnode, float rntc, float temp_c, int heat_pct, int fan_pct, ZoneCtrl *z) {
     char buf[22];
     ssd1306_clear();
 
-    {
-        char v_str[8];
-        format_fixed1(v_str, sizeof(v_str), vnode);
-        snprintf(buf, sizeof(buf), "A:%4lu V:%s", (unsigned long)adc_avg, v_str);
-    }
+    char v_str[8]; format_fixed1(v_str, sizeof(v_str), vnode);
+    snprintf(buf, sizeof(buf), "A:%4lu V:%s", (unsigned long)adc_avg, v_str);
     ssd1306_print(0, 0, buf);
 
-    {
-        char r_str[8], t_str[8];
-        format_fixed1(r_str, sizeof(r_str), rntc);
-        format_fixed1(t_str, sizeof(t_str), temp_c);
-        snprintf(buf, sizeof(buf), "R:%s T:%sC", r_str, t_str);
-    }
+    char r_str[8], t_str[8];
+    format_fixed1(r_str, sizeof(r_str), rntc);
+    format_fixed1(t_str, sizeof(t_str), temp_c);
+    snprintf(buf, sizeof(buf), "R:%s T:%sC", r_str, t_str);
     ssd1306_print(0, 8, buf);
 
     const char *st_str = "?";
-    switch (zone1.state) {
+    switch (z->state) {
         case ST_IDLE:     st_str = "IDLE"; break;
         case ST_PID:      st_str = "RUN "; break;
         case ST_THROTTLE: st_str = "THRT"; break;
@@ -256,31 +502,28 @@ static void oled_update(uint32_t adc_avg, float vnode, float rntc,
         case ST_FAULT:    st_str = "FALT"; break;
     }
 
-    if (zone1.state == ST_FAULT) {
+    if (z->state == ST_FAULT) {
         const char *fr = "?";
-        switch (zone1.fault_reason) {
-            case FR_NTC_OPEN:  fr = "NTC OPEN";  break;
-            case FR_NTC_SHORT: fr = "NTC SHORT"; break;
-            default:           fr = "FAULT";     break;
+        switch (z->fault_reason) {
+            case FR_NTC_OPEN:     fr = "NTC OPEN";  break;
+            case FR_NTC_SHORT:    fr = "NTC SHORT"; break;
+            case FR_FAN_OPEN:     fr = "FAN OPEN";  break;
+            case FR_NODE_OFFLINE: fr = "OFFLINE";   break;
+            default:              fr = "FAULT";     break;
         }
-        snprintf(buf, sizeof(buf), "%s %s", zone1.name, fr);
+        snprintf(buf, sizeof(buf), "%s %s", z->name, fr);
     } else {
-        char thr = (zone1.state == ST_THROTTLE) ? '!' : ' ';
-        snprintf(buf, sizeof(buf), "%s %s H%2d F%2d%c",
-                 zone1.name, st_str, heat_pct, fan_pct, thr);
+        char thr = (z->state == ST_THROTTLE) ? '!' : ' ';
+        snprintf(buf, sizeof(buf), "%s %s H%2d F%2d%c", z->name, st_str, heat_pct, fan_pct, thr);
     }
     ssd1306_print(0, 16, buf);
-
     ssd1306_draw_line(0, 20, 127, 20);
 
-    const uint8_t PLOT_TOP    = 22;
-    const uint8_t PLOT_BOTTOM = 63;
-    const uint8_t PLOT_H      = PLOT_BOTTOM - PLOT_TOP;
-
+    const uint8_t PLOT_TOP = 22, PLOT_BOTTOM = 63, PLOT_H = PLOT_BOTTOM - PLOT_TOP;
     float half_span = THERM_PLOT_K * ema_dev;
     if (half_span < THERM_PLOT_MIN_SPAN / 2.0f) half_span = THERM_PLOT_MIN_SPAN / 2.0f;
     float plot_min = ema_mean - half_span;
-    float span     = 2.0f * half_span;
+    float span = 2.0f * half_span;
 
     int32_t prev_y = -1;
     for (uint8_t x = 0; x < THERM_PLOT_LEN; x++) {
@@ -297,319 +540,33 @@ static void oled_update(uint32_t adc_avg, float vnode, float rntc,
     ssd1306_update();
 }
 
-/* ============================================================================
- * FSM HELPERS
- * ========================================================================== */
-/* Pass in the commanded duty and the measured RPM */
-static FaultReason detect_fault(float vnode, uint32_t fan_rpm){
-    /* 1. NTC hardware faults take priority */
-    if (vnode > V_OPEN_THRESH)  return FR_NTC_OPEN;
-    if (vnode < V_SHORT_THRESH) return FR_NTC_SHORT;
-
-    /* 2. Fan hardware fault */
-    if (fan_rpm < FAN_STALL_RPM) {
-        return FR_FAN_OPEN;
-    }
-
-    return FR_NONE;
-}
-
-static void zone_all_off(ZoneCtrl *z)
-{
-    z->fan_cmd    = 0.0f;
-    g_fan_duty    = 0.0f;
-    g_heater_duty = 0.0f;
-}
-
-static void zone_enter_cooldown(ZoneCtrl *z)
-{
-    z->cool_ticks = 0;
-    g_heater_duty = 0.0f;
-    z->fan_cmd    = 1.0f;
-    g_fan_duty    = 1.0f;
-    z->state      = ST_COOLING;
-}
-
-static void zone_enter_pid(ZoneCtrl *z, float seed_temp_c)
-{
-    pid_temp = seed_temp_c;
-    PID_Init(&z->pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, seed_temp_c);
-    z->pid.out_min     = 0.0f;
-    z->pid.out_max     = 1.0f;
-    z->fault_count     = 0;
-    z->recover_count   = 0;
-    z->throttle_count  = 0;
-    g_heater_duty      = g_heater_request;
-    z->state           = ST_PID;
-}
-
-
-static void zone_enter_throttle(ZoneCtrl *z)
-{
-    /* snapshot user's request and setpoint so exit logic can detect changes */
-    z->mode_c_snap_request  = g_heater_request;
-    z->mode_c_snap_setpoint = z->setpoint_c;
-
-    /* peg the fan to maximum — bookkeeping AND hardware, this tick */
-    z->fan_cmd = 1.0f;
-    g_fan_duty = 1.0f;
-
-    /* throttle PID: forward-acting (positive gains), seeded for bumpless
-     * transfer — first output lands on the duty already in the heater */
-                PID_Init(&z->pid_throttle, THROTTLE_PID_KP, THROTTLE_PID_KI, THROTTLE_PID_KD,
- PID_TS, PID_TAU_F, pid_temp);
-    z->pid_throttle.out_min  = 0.0f;
-    z->pid_throttle.out_max  = HEATER_MAX;
-    z->pid_throttle.integral = g_heater_duty
-                             - THROTTLE_PID_KP * (z->setpoint_c - pid_temp);
-    z->state = ST_THROTTLE;
-}
-static void zone_enter_fault(ZoneCtrl *z, FaultReason r)
-{
-    g_heater_duty    = 0.0f;
-    z->fan_cmd       = 1.0f;
-    g_fan_duty       = 1.0f;
-    z->fault_reason  = r;
-    z->recover_count = 0;
-    z->state         = ST_FAULT;
-}
-
-/* ============================================================================
- * Zone_Tick
- * ========================================================================== */
-void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c, uint32_t fan_rpm){
-	FaultReason fault_candidate = detect_fault(vnode, fan_rpm);
-    switch (z->state) {
-
-    case ST_IDLE:
-        zone_all_off(z);
-        if (z->start_req) {
-            z->start_req = 0;
-            if (fault_candidate == FR_NONE) zone_enter_pid(z, raw_t_c);
-            else                            zone_enter_fault(z, fault_candidate);
-        }
-        break;
-
-    case ST_PID:
-        /* ── fault debounce ─────────────────────────────────────────── */
-        if (fault_candidate != FR_NONE) {
-            z->fault_count++;
-            if (z->fault_count >= FAULT_TRIP_N) {
-                zone_enter_fault(z, fault_candidate);
-                break;
-            }
-        } else {
-            z->fault_count = 0;
-        }
-        if (z->stop_req) {
-            z->stop_req = 0;
-            zone_enter_cooldown(z);
-            break;
-        }
-
-        /* ── Tier 1: fan PID ────────────────────────────────────────── */
-        z->fan_cmd = PID_Update(&z->pid, z->setpoint_c, ema_t_c);
-        if (z->fan_cmd < 0.0f) z->fan_cmd = 0.0f;
-        if (z->fan_cmd > 1.0f) z->fan_cmd = 1.0f;
-        g_fan_duty    = z->fan_cmd;
-        g_heater_duty = g_heater_request;
-
-        /* ── Tier 2: detect Mode C entry ────────────────────────────── */
-        {
-            uint8_t fan_saturated = (z->fan_cmd > THROTTLE_FAN_SAT);
-            uint8_t still_hot     = (ema_t_c > z->setpoint_c + THROTTLE_MARGIN_C);
-
-            if (fan_saturated && still_hot) {
-                z->throttle_count++;
-                if (z->throttle_count >= THROTTLE_ENGAGE_N) {
-                    z->throttle_count = 0;
-                    zone_enter_throttle(z);
-                    break;              /* leave switch; we're ST_THROTTLE now */
-                }
-            } else {
-                z->throttle_count = 0;  /* any good tick resets the debounce */
-            }
-        }
-        break;
-
-    case ST_THROTTLE:
-        /* ── fault debounce (same as ST_PID) ────────────────────────── */
-        if (fault_candidate != FR_NONE) {
-            z->fault_count++;
-            if (z->fault_count >= FAULT_TRIP_N) {
-                zone_enter_fault(z, fault_candidate);
-                break;
-            }
-        } else {
-            z->fault_count = 0;
-        }
-        if (z->stop_req) {
-            z->stop_req = 0;
-            zone_enter_cooldown(z);
-            break;
-        }
-
-        g_fan_duty = 1.0f;
-
-        /* control law: throttle PID finds the largest sustainable heater duty */
-        g_heater_duty = PID_Update(&z->pid_throttle, z->setpoint_c, ema_t_c);
-
-        /* exit checks */
-        {
-            uint8_t request_changed =
-                (z->setpoint_c      != z->mode_c_snap_setpoint) ||
-                (g_heater_request   != z->mode_c_snap_request);
-
-            /* Sustainable = throttle output has climbed back up to the user's
-             * request AND the temperature is no longer overheating. */
-            uint8_t recovered = (ema_t_c <= z->setpoint_c);
-
-            uint8_t sustainable =
-                (g_heater_duty >= z->mode_c_snap_request - THROTTLE_EXIT_MARGIN) && recovered;
-
-            if (request_changed || sustainable) {
-                zone_enter_pid(z, ema_t_c);          /* clean re-entry        */
-                z->pid.integral = g_fan_duty;        /* bumpless seed reverse */
-                break;
-            }
-        }
-        break;
-
-    case ST_COOLING:
-        g_heater_duty = 0.0f;
-        z->fan_cmd    = 1.0f;
-        g_fan_duty    = 1.0f;
-        z->cool_ticks++;
-        {
-            uint8_t cool_now  = (raw_t_c < COOL_THRESH_C);
-            uint8_t sane      = (fault_candidate == FR_NONE);
-            uint8_t timed_out = (z->cool_ticks >= COOLING_TIMEOUT_TICKS);
-            if ((cool_now && sane) || timed_out) {
-                zone_all_off(z);
-                z->state = ST_IDLE;
-            }
-        }
-        break;
-        /* TODO 2: Fan Fault Detection Logic
-         * Decide when to override fault_candidate with FR_FAN_OPEN.
-         * Hint 1: What happens if g_fan_duty is 0.0? Should RPM = 0 trigger a fault?
-         * Hint 2: The fan has physical inertia. When duty jumps from 0.0 to 1.0,
-         *         RPM is 0 for a fraction of a second. How does your existing
-         *         z->fault_count (which trips at FAULT_TRIP_N) protect you here?
-         */
-    case ST_FAULT:
-        g_heater_duty = 0.0f;
-        z->fan_cmd    = 1.0f;
-        g_fan_duty    = 1.0f;
-        if (fault_candidate == FR_NONE) {
-            z->recover_count++;
-            if (z->recover_count >= FAULT_RECOVER_M) {
-                z->fault_reason = FR_NONE;
-                zone_enter_cooldown(z);
-            }
-
-        } else {
-            z->recover_count = 0;
-        }
-        break;
-
-    default:
-        zone_enter_fault(z, FR_NONE);
-        break;
-    }
-
-}
-
-/* ============================================================================
- * CONTROL TASK
- * ========================================================================== */
-static void ControlTask(void const *argument)
+static void UITask(void *argument)
 {
     (void)argument;
-    Event_t evt;
+    for (;;) {
+        I2C_Telemetry tel;
+        uint8_t online;
 
-    for (;;)
-    {
-        if (xQueueReceive(xCtrlQueue, &evt, portMAX_DELAY) != pdPASS) continue;
+        xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+        tel = g_nodes[0].tel;
+        online = g_nodes[0].is_online;
+        xSemaphoreGive(xNodeMutex);
 
-        switch (evt)
-        {
-        case EVT_PID_TICK:
-        {
-            uint32_t lat = CYC_TO_US(DWT->CYCCNT - g_prof.tick_stamp);
-            g_prof.lat_last_us = lat;
-            if (lat > g_prof.lat_max_us) g_prof.lat_max_us = lat;
-            if (lat < g_prof.lat_min_us) g_prof.lat_min_us = lat;
-            g_prof.tick_count++;
-
-            uint32_t tc0 = DWT->CYCCNT;
-
-            uint32_t adc_avg = adc_average(THERM_ADC_OVERSAMPLE);
-            float vnode  = THERM_ADC_VREF * ((float)adc_avg / 4095.0f);
-            float rntc   = adc_to_rntc(adc_avg);
-            float temp_c = rntc_to_celsius(rntc);
-
-            if (zone1.state == ST_PID || zone1.state == ST_THROTTLE)
-                pid_temp = pid_temp + 0.02f * (temp_c - pid_temp);
-
-            /* 1. Read and clear pulses (1 Hz window) */
-            uint32_t current_pulses = g_tach_pulses;
-            g_tach_pulses = 0;
-
-            /* TODO 3: Compute RPM */
-            uint32_t current_rpm = 0; /* Replace with your math: 2 pulses per rev, 1 sec window */
-            current_rpm = current_pulses*30;
-            /* Pass into Zone_Tick */
-            Zone_Tick(&zone1, vnode, temp_c, pid_temp, current_rpm);
-
-            /* Tier 3 hard safety backstop */
-            if (temp_c > MAX_SAFE_TEMP_C) {
-                g_heater_duty = 0.0f;
-                g_fan_duty    = 1.0f;
-            }
-
-            log_sample(temp_c, pid_temp, vnode, g_fan_duty, g_heater_duty,
-                                   g_heater_request, zone1.setpoint_c, current_rpm);
-            emit_change_events(&zone1);
-
-            pwm_update();
-
-            g_prof.ctrl_us = CYC_TO_US(DWT->CYCCNT - tc0);
-            break;
+        float temp_c = 0.0f, vnode = 0.0f, rntc = 0.0f;
+        if (online) {
+            vnode = 5.0f * ((float)tel.adc_raw / 1023.0f);
+            rntc = adc_to_rntc_5v(vnode);
+            temp_c = rntc_to_celsius(rntc);
         }
-
-        case EVT_START_CMD: zone1.start_req = 1; break;
-        case EVT_STOP_CMD:  zone1.stop_req  = 1; break;
-        default: break;
-        }
-    }
-}
-
-/* ============================================================================
- * UI TASK
- * ========================================================================== */
-static void UITask(void const *argument)
-{
-    (void)argument;
-
-    for (;;)
-    {
-        uint32_t adc_avg = adc_average(THERM_ADC_OVERSAMPLE);
-        float vnode  = THERM_ADC_VREF * ((float)adc_avg / 4095.0f);
-        float rntc   = adc_to_rntc(adc_avg);
-        float temp_c = rntc_to_celsius(rntc);
-
-        dbg_adc_avg = adc_avg; dbg_vnode = vnode;
-        dbg_rntc = rntc;       dbg_temp_c = temp_c;
 
         if (!ema_initialized) {
             ema_temp_display = temp_c;
-            ema_mean         = temp_c;
-            ema_dev          = 1.0f;
-            ema_initialized  = 1;
+            ema_mean = temp_c;
+            ema_dev = 1.0f;
+            ema_initialized = 1;
         } else {
             ema_temp_display = ema_step(ema_temp_display, temp_c, THERM_EMA_DISPLAY);
-            ema_mean         = ema_step(ema_mean, ema_temp_display, THERM_EMA_MEAN);
+            ema_mean = ema_step(ema_mean, ema_temp_display, THERM_EMA_MEAN);
             float abs_dev = ema_temp_display - ema_mean;
             if (abs_dev < 0.0f) abs_dev = -abs_dev;
             ema_dev = ema_step(ema_dev, abs_dev, THERM_EMA_DEV);
@@ -619,11 +576,10 @@ static void UITask(void const *argument)
         plot_buf[plot_head] = ema_temp_display;
         plot_head = (uint8_t)((plot_head + 1) % THERM_PLOT_LEN);
 
-        int heat_pct = (int)(g_heater_duty * 100.0f + 0.5f);
-        int fan_pct  = (int)(g_fan_duty    * 100.0f + 0.5f);
+        int heat_pct = (int)(zones[0].heater_duty * 100.0f + 0.5f);
+        int fan_pct  = (int)(zones[0].fan_duty    * 100.0f + 0.5f);
 
-        oled_update(adc_avg, vnode, rntc, ema_temp_display, heat_pct, fan_pct);
-
+        oled_update(tel.adc_raw, vnode, rntc, ema_temp_display, heat_pct, fan_pct, &zones[0]);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -647,11 +603,6 @@ void ThermalApp_Init(void)
 {
     cyc_init();
 
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
-    HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2);
-    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, 0);
-
     memset(plot_buf, 0, sizeof(plot_buf));
     plot_head = 0;
 
@@ -663,21 +614,21 @@ void ThermalApp_Init(void)
         thermal_log_magic = THERMAL_LOG_MAGIC;
     }
 
-    uint32_t adc_raw   = adc_average(THERM_ADC_OVERSAMPLE);
-    float    init_temp  = rntc_to_celsius(adc_to_rntc(adc_raw));
-    pid_temp = init_temp;
-
-    PID_Init(&zone1.pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, init_temp);
-    zone1.state          = ST_IDLE;
-    zone1.fault_reason   = FR_NONE;
-    zone1.fault_count    = 0;
-    zone1.recover_count  = 0;
-    zone1.cool_ticks     = 0;
-    zone1.throttle_count = 0;
+    for (int i = 0; i < NUM_REMOTE_NODES; i++) {
+        char name_buf[4];
+        snprintf(name_buf, sizeof(name_buf), "Z%d", i);
+        zones[i].name = strdup(name_buf); /* Fine for embedded if called once */
+        zones[i].state = ST_IDLE;
+        zones[i].fault_reason = FR_NONE;
+        zones[i].setpoint_c = 30.0f;
+        zones[i].requested_heater_duty = 0.2f;
+        zones[i].pid_temp = 25.0f;
+        PID_Init(&zones[i].pid, PID_KP, PID_KI, PID_KD, PID_TS, PID_TAU_F, 25.0f);
+    }
 
     ssd1306_clear();
-    ssd1306_print(0, 0,  "CHIP COOLER");
-    ssd1306_print(0, 16, "V4.0 MODE-C");
+    ssd1306_print(0, 0,  "BMC MASTER");
+    ssd1306_print(0, 16, "V5.0 DISTRIBUTED");
     ssd1306_update();
     HAL_Delay(800);
 }
@@ -686,66 +637,11 @@ void ThermalApp_StartTasks(void)
 {
     xCtrlQueue = xQueueCreate(8, sizeof(Event_t));
     xAdcMutex  = xSemaphoreCreateMutex();
-
-    /* --- NEW CODE --- */
     xNodeMutex = xSemaphoreCreateMutex();
-    xTaskCreate(BusTask, "Bus", 512, NULL, 2, NULL); /* Priority 2 */
-    /* ---------------- */
 
+    xTaskCreate(BusTask, "Bus", 512, NULL, 2, NULL);
     xTaskCreate(ControlTask, "Ctrl", 512, NULL, 3, NULL);
     xTaskCreate(UITask,      "UI",   512, NULL, 1, NULL);
+
     HAL_TIM_Base_Start_IT(&htim2);
-}
-
-/* ============================================================================
- * BUS TASK (I2C Master)
- * ========================================================================== */
-static void BusTask(void *argument)
-{
-    (void)argument;
-    /* Base I2C addresses for the 3 ATmega nodes */
-    const uint16_t node_addrs[NUM_REMOTE_NODES] = {0x20, 0x22, 0x24};
-
-    for(;;) {
-        for(int i = 0; i < NUM_REMOTE_NODES; i++) {
-            I2C_Telemetry temp_tel;
-            I2C_Command   temp_cmd;
-
-            /* 1. Read the command we need to send safely */
-            xSemaphoreTake(xNodeMutex, portMAX_DELAY);
-            temp_cmd = g_nodes[i].cmd;
-            xSemaphoreGive(xNodeMutex);
-
-            /* 2. Execute the physical I2C Write and Read (Blocking) */
-            HAL_StatusTypeDef tx_stat = HAL_I2C_Master_Transmit(&hi2c1, node_addrs[i], (uint8_t*)&temp_cmd, sizeof(I2C_Command), 10);
-            HAL_StatusTypeDef rx_stat = HAL_I2C_Master_Receive(&hi2c1, node_addrs[i], (uint8_t*)&temp_tel, sizeof(I2C_Telemetry), 10);
-
-            /* TODO 3: Handle the result and update shared memory safely. */
-            if (tx_stat == HAL_OK && rx_stat == HAL_OK) {
-                /* The bus transaction succeeded!
-                 * - Safely lock xNodeMutex.
-                 * - Copy temp_tel into g_nodes[i].tel.
-                 * - Set g_nodes[i].is_online to 1.
-                 * - Unlock xNodeMutex.
-                 */
-                xSemaphoreTake(xNodeMutex, portMAX_DELAY);
-                g_nodes[i].tel = temp_tel;
-                g_nodes[i].is_online = 1;
-                xSemaphoreGive(xNodeMutex);
-
-            } else {
-                /* The node timed out, NACK'd, or the wire is unplugged.
-                 * - Safely lock xNodeMutex.
-                 * - Set g_nodes[i].is_online to 0.
-                 * - Unlock xNodeMutex.
-                 */
-                xSemaphoreTake(xNodeMutex, portMAX_DELAY);
-                g_nodes[i].is_online = 0;
-                xSemaphoreGive(xNodeMutex);
-
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100)); /* Poll at 10 Hz */
-    }
 }
