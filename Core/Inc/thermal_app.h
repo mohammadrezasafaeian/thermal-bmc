@@ -114,9 +114,31 @@ typedef enum {
 #define HEATER_MAX             1.0f
 #define THROTTLE_EXIT_MARGIN   0.02f   /* duty headroom for Mode C exit      */
 #define FAN_STALL_RPM 300  /* Fault threshold: min speed is ~1200 RPM */
+#define NUM_REMOTE_NODES 3
+
 /* ============================================================================
  * ZoneCtrl - the unit of replication
  * ========================================================================== */
+
+
+/* Sent from ATmega -> STM32 (Master Read, 4 bytes) */
+typedef struct {
+    uint16_t adc_raw;
+    uint16_t tach_pulses;
+} I2C_Telemetry;
+
+/* Sent from STM32 -> ATmega (Master Write, 2 bytes) */
+typedef struct {
+    uint8_t heater_pwm;
+    uint8_t fan_pwm;
+} I2C_Command;
+
+/* The Shared Memory Object */
+typedef struct {
+    I2C_Telemetry tel;
+    I2C_Command   cmd;
+    uint8_t       is_online;  /* 1 = healthy, 0 = unplugged/failed */
+} RemoteNode;
 typedef struct {
     const char     *name;
     ThermalState    state;

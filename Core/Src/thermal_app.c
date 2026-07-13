@@ -36,6 +36,7 @@ static SemaphoreHandle_t xAdcMutex;
 
 static void ControlTask(void const *argument);
 static void UITask(void const *argument);
+static void BusTask(void *argument);
 static void emit_change_events(ZoneCtrl *z);
 static void zone_all_off(ZoneCtrl *z);
 static void zone_enter_cooldown(ZoneCtrl *z);
@@ -54,6 +55,8 @@ extern volatile uint32_t g_tach_pulses;
 /* ============================================================================
  * PUBLIC GLOBALS
  * ========================================================================== */
+RemoteNode g_nodes[NUM_REMOTE_NODES];
+SemaphoreHandle_t xNodeMutex;
 ZoneCtrl zone1 = {
     .name         = "Z1",
     .state        = ST_IDLE,
@@ -683,7 +686,66 @@ void ThermalApp_StartTasks(void)
 {
     xCtrlQueue = xQueueCreate(8, sizeof(Event_t));
     xAdcMutex  = xSemaphoreCreateMutex();
+
+    /* --- NEW CODE --- */
+    xNodeMutex = xSemaphoreCreateMutex();
+    xTaskCreate(BusTask, "Bus", 512, NULL, 2, NULL); /* Priority 2 */
+    /* ---------------- */
+
     xTaskCreate(ControlTask, "Ctrl", 512, NULL, 3, NULL);
     xTaskCreate(UITask,      "UI",   512, NULL, 1, NULL);
     HAL_TIM_Base_Start_IT(&htim2);
+}
+
+/* ============================================================================
+ * BUS TASK (I2C Master)
+ * ========================================================================== */
+static void BusTask(void *argument)
+{
+    (void)argument;
+    /* Base I2C addresses for the 3 ATmega nodes */
+    const uint16_t node_addrs[NUM_REMOTE_NODES] = {0x20, 0x22, 0x24};
+
+    for(;;) {
+        for(int i = 0; i < NUM_REMOTE_NODES; i++) {
+            I2C_Telemetry temp_tel;
+            I2C_Command   temp_cmd;
+
+            /* 1. Read the command we need to send safely */
+            xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+            temp_cmd = g_nodes[i].cmd;
+            xSemaphoreGive(xNodeMutex);
+
+            /* 2. Execute the physical I2C Write and Read (Blocking) */
+            HAL_StatusTypeDef tx_stat = HAL_I2C_Master_Transmit(&hi2c1, node_addrs[i], (uint8_t*)&temp_cmd, sizeof(I2C_Command), 10);
+            HAL_StatusTypeDef rx_stat = HAL_I2C_Master_Receive(&hi2c1, node_addrs[i], (uint8_t*)&temp_tel, sizeof(I2C_Telemetry), 10);
+
+            /* TODO 3: Handle the result and update shared memory safely. */
+            if (tx_stat == HAL_OK && rx_stat == HAL_OK) {
+                /* The bus transaction succeeded!
+                 * - Safely lock xNodeMutex.
+                 * - Copy temp_tel into g_nodes[i].tel.
+                 * - Set g_nodes[i].is_online to 1.
+                 * - Unlock xNodeMutex.
+                 */
+                xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+                g_nodes[i].tel = temp_tel;
+                g_nodes[i].is_online = 1;
+                xSemaphoreGive(xNodeMutex);
+
+            } else {
+                /* The node timed out, NACK'd, or the wire is unplugged.
+                 * - Safely lock xNodeMutex.
+                 * - Set g_nodes[i].is_online to 0.
+                 * - Unlock xNodeMutex.
+                 */
+                xSemaphoreTake(xNodeMutex, portMAX_DELAY);
+                g_nodes[i].is_online = 0;
+                xSemaphoreGive(xNodeMutex);
+
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100)); /* Poll at 10 Hz */
+    }
 }
