@@ -1,0 +1,37 @@
+=== TWI DEBUG DUMP REPORT (paste this whole block) ===
+dbg_head: NOT PROVIDED
+status bytes: 256   frames: 15   ring overflows('!'): 0
+RST banners: 0  
+
+-- status histogram --
+  0x00 x18    BUS_ERROR
+  0x0A x2     UNKNOWN CODE
+  0x0D x2     UNKNOWN CODE
+  0x40 x72    UNKNOWN CODE
+  0x60 x14    SLA+W rx, ACKed        (write frame opens)
+  0x70 x70    GENCALL rx             (ABNORMAL: gen-call is off)
+  0x76 x20    UNKNOWN CODE
+  0x78 x38    UNKNOWN CODE
+  0x81 x20    UNKNOWN CODE
+
+-- frame classification --
+  WRITE-PARTIAL    x14
+  OTHER            x1
+
+-- first 12 frames verbatim --
+  [0D 0A 76 70 40 81 70 40 76 70 40 78 70 40 78 70 40 81 70 40 76 70 40 78 70 40 78 70]  OTHER
+  [60 81 70 40 76 70 40 78 70 40 78 70 40 81 70 40 76 70 40 78 70 40 78]  WRITE-PARTIAL
+  [60 40 81 70]  WRITE-PARTIAL
+  [60 76 70 40 78 70 40 78 70 40 81 70 40 76 70 40 78 70 40 78 70 40 81 70 40 76 70 40 78 70 40 78]  WRITE-PARTIAL
+  [60 40 81 70 40 76 70 40 78 70 40 78 70 40 81 70 40 76 70 40 78 70 40 78 70 40 81 70 40 76 70]  WRITE-PARTIAL
+  [60 78 70 40 78 70 40 81 70 40 76 70 40 78]  WRITE-PARTIAL
+  [60 40 78 70 40 81 70 40 76 70]  WRITE-PARTIAL
+  [60 78 70 40 78 70 40 81 70 40 76 70 40 78 70 40 78 70 40 81 70 40 76 70]  WRITE-PARTIAL
+  [60 78 70 40 78 70 40 81 70 40 76 70 40 78]  WRITE-PARTIAL
+  [60 40 78 70 40 81]  WRITE-PARTIAL
+  [60 40 76 70 40 78 70 40 78 70]  WRITE-PARTIAL
+  [60 81 70 40 76]  WRITE-PARTIAL
+
+-- auto-verdict (heuristic, confirm with tutor) --
+  Mixed/partial pattern - send full report for analysis.
+=== END REPORT ===
