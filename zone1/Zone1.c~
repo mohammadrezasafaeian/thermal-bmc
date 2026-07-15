@@ -1,0 +1,214 @@
+/* ============================================================
+   Zone1 node - DEBUG BUILD - bare-metal TWI slave + LED probe
+   ATmega32 @ 8 MHz, CVAVR.  LED on PB0 (active high).
+   ============================================================ */
+#include <mega32.h>
+#include <delay.h>
+
+/* ---------- I2C data contracts (match STM32) ---------- */
+typedef struct { unsigned int adc_raw; unsigned int tach_pulses; } I2C_Telemetry;
+typedef struct { unsigned char heater_pwm; unsigned char fan_pwm; } I2C_Command;
+
+I2C_Telemetry node_tel;
+I2C_Command   node_cmd;
+
+volatile unsigned int  live_tach_count = 0;
+float adc_ema = 0.0;
+
+/* ---------- TWI bare metal ---------- */
+#define B_TWINT 0x80
+#define B_TWEA  0x40
+#define B_TWSTO 0x10
+#define B_TWEN  0x04
+#define B_TWIE  0x01
+#define TWCR_ARMED (B_TWEA | B_TWEN | B_TWIE)          /* 0x45 */
+#define TWCR_REARM (B_TWINT | B_TWEA | B_TWEN | B_TWIE)
+#define NODE_TWAR  (0x20 << 1)                          /* 0x40 */
+
+#define S_SLA_W_RX     0x60
+#define S_DATA_RX_ACK  0x80
+#define S_STOP_RSTART  0xA0
+#define S_SLA_R_RX     0xA8
+#define S_DATA_TX_ACK  0xB8
+#define S_DATA_TX_NACK 0xC0
+#define S_LAST_TX_ACK  0xC8
+#define S_BUS_ERROR    0x00
+
+unsigned char rx_buf[2];
+unsigned char tx_buf[4];
+unsigned char rx_idx = 0, tx_idx = 0;
+
+/* ---------- debug instrumentation ---------- */
+volatile unsigned char twi_evt_count  = 0;   /* ++ every TWI ISR entry   */
+volatile unsigned char twi_last_stat  = 0;   /* last TWSR status seen    */
+
+#define LED_ON()   (PORTB |=  0x01)
+#define LED_OFF()  (PORTB &= ~0x01)
+
+void led_blip(unsigned char ms_on)
+{
+    LED_ON();  delay_ms(ms_on);  LED_OFF();
+}
+
+/* ---------- ISRs ---------- */
+interrupt [EXT_INT0] void ext_int0_isr(void)
+{
+    live_tach_count++;
+}
+
+interrupt [TIM1_COMPA] void timer1_compa_isr(void)
+{
+    node_tel.tach_pulses = live_tach_count;
+    live_tach_count = 0;
+}
+
+interrupt [TWI] void twi_isr(void)
+{
+    twi_evt_count++;                     /* debug: proves ISR entry */
+    twi_last_stat = TWSR & 0xF8;
+
+    switch (twi_last_stat)
+    {
+    case S_SLA_W_RX:
+        rx_idx = 0;
+        break;
+
+    case S_DATA_RX_ACK:
+        if (rx_idx < sizeof(rx_buf)) rx_buf[rx_idx++] = TWDR;
+        /* PLACEHOLDER (over-length policy still YOUR call):
+           extra bytes beyond 2 are read-and-discarded, still ACKed */
+        break;
+
+    case S_STOP_RSTART:
+        /* PLACEHOLDER (apply-policy still YOUR call):
+           apply only if exactly a full command arrived */
+        if (rx_idx == sizeof(I2C_Command)) {
+            node_cmd = *((I2C_Command*)rx_buf);
+            OCR0 = node_cmd.heater_pwm;
+            OCR2 = node_cmd.fan_pwm;
+        }
+        break;
+
+    case S_SLA_R_RX:
+        /* snapshot telemetry; gie is off inside ISR so TIM1 can't tear this */
+        *((I2C_Telemetry*)tx_buf) = node_tel;
+        tx_idx = 0;
+        TWDR = tx_buf[tx_idx++];
+        break;
+
+    case S_DATA_TX_ACK:
+        /* PLACEHOLDER (over-read policy still YOUR call): pad 0xFF */
+        TWDR = (tx_idx < sizeof(tx_buf)) ? tx_buf[tx_idx++] : 0xFF;
+        break;
+
+    case S_DATA_TX_NACK:
+    case S_LAST_TX_ACK:
+        break;
+
+    case S_BUS_ERROR:
+        TWCR = B_TWINT | B_TWSTO | TWCR_ARMED;
+        return;
+    }
+    TWCR = TWCR_REARM;
+}
+
+/* ---------- ADC ---------- */
+#define ADC_VREF_TYPE ((0<<REFS1) | (1<<REFS0) | (0<<ADLAR))
+unsigned int read_adc(unsigned char ch)
+{
+    ADMUX = ch | ADC_VREF_TYPE;
+    delay_us(10);
+    ADCSRA |= (1<<ADSC);
+    while ((ADCSRA & (1<<ADIF)) == 0);
+    ADCSRA |= (1<<ADIF);
+    return ADCW;
+}
+
+void main(void)
+{
+    unsigned char i;
+    unsigned int  loop_ct = 0;
+    unsigned char last_evt = 0;
+    unsigned int  raw;
+
+    /* Ports: PB0 = debug LED (out), PB3 = OC0 heater (out),
+       PD7 = OC2 fan (out), PD2 = INT0 tach with pull-up */
+    DDRB  = (1<<DDB3) | (1<<DDB0);
+    PORTB = 0x00;
+    DDRA  = 0x00;  PORTA = 0x00;
+    DDRC  = 0x00;  PORTC = 0x00;
+    DDRD  = (1<<DDD7);
+    PORTD = (1<<PORTD2);
+
+    /* Timer0: heater PWM, fast PWM, 8MHz/64 */
+    TCCR0 = (1<<WGM00)|(1<<COM01)|(1<<WGM01)|(0<<CS02)|(1<<CS01)|(1<<CS00);
+    TCNT0 = 0x00; OCR0 = 0x00;
+
+    /* Timer1: CTC 1 Hz (8MHz/256, OCR1A=31249) */
+    TCCR1A = 0x00;
+    TCCR1B = (1<<WGM12)|(1<<CS12);
+    TCNT1H = 0; TCNT1L = 0;
+    OCR1AH = 0x7A; OCR1AL = 0x11;
+
+    /* Timer2: fan PWM ~31.25 kHz, fast PWM, no prescale
+       (hand-set: wizard regen will revert this - see ledger) */
+    ASSR  = 0;
+    TCCR2 = (1<<WGM20)|(1<<COM21)|(1<<WGM21)|(1<<CS20);
+    TCNT2 = 0x00; OCR2 = 0x00;
+
+    TIMSK = (1<<OCIE1A);
+
+    /* INT0 rising edge */
+    GICR  |= (1<<INT0);
+    MCUCR  = (1<<ISC01)|(1<<ISC00);
+    GIFR   = (1<<INTF0);
+
+    /* ADC: AVCC ref, 125 kHz */
+    ADMUX  = ADC_VREF_TYPE;
+    ADCSRA = (1<<ADEN)|(1<<ADPS2)|(1<<ADPS1);
+    SFIOR  = 0x00;
+
+    /* ---- TWI slave init, bare metal ---- */
+    TWAR = NODE_TWAR;      /* 0x40: addr 0x20, no general call */
+    TWCR = TWCR_ARMED;     /* TWEA|TWEN|TWIE = ACK own address */
+
+    #asm("sei")
+
+    /* ===== DEBUG STAGE 1: boot signature = 3 quick flashes ===== */
+    for (i = 0; i < 3; i++) { led_blip(60); delay_ms(140); }
+    delay_ms(600);
+
+    /* ===== DEBUG STAGE 2: register probe ===== */
+    if (((TWCR & TWCR_ARMED) != TWCR_ARMED) || (TWAR != NODE_TWAR))
+        while (1) { led_blip(50); delay_ms(50); }   /* rapid strobe = FAIL */
+
+    adc_ema = (float)read_adc(0);
+
+    /* ===== main loop + DEBUG STAGE 3: heartbeat / activity ===== */
+    while (1)
+    {
+        raw = read_adc(0);
+        adc_ema = adc_ema + 0.05 * ((float)raw - adc_ema);
+        /* TODO (owed, unchanged): this 16-bit store can still be torn
+           by the TWI ISR - your atomicity fix goes here */
+        node_tel.adc_raw = (unsigned int)(adc_ema + 0.5);
+
+        delay_ms(10);
+        loop_ct++;
+
+        /* re-probe registers every pass: catch late clobbering */
+        if (((TWCR & TWCR_ARMED) != TWCR_ARMED) || (TWAR != NODE_TWAR))
+            while (1) { led_blip(50); delay_ms(50); }
+
+        /* TWI activity? double-blip immediately */
+        if (twi_evt_count != last_evt) {
+            last_evt = twi_evt_count;
+            led_blip(30); delay_ms(60); led_blip(30);
+        }
+        /* otherwise: lonely heartbeat every ~2 s */
+        else if (loop_ct >= 200) {
+            loop_ct = 0;
+            led_blip(30);
+        }
+    }
+}

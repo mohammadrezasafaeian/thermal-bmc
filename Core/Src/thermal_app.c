@@ -26,7 +26,7 @@
 static QueueHandle_t     xCtrlQueue;
 static SemaphoreHandle_t xAdcMutex;
 SemaphoreHandle_t        xNodeMutex;
-
+SemaphoreHandle_t 		 xI2cMutex;
 static void ControlTask(void *argument);
 static void UITask(void *argument);
 static void BusTask(void *argument);
@@ -302,6 +302,7 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c, uint32_t 
         z->heater_duty = PID_Update(&z->pid_throttle, z->setpoint_c, ema_t_c);
 
         /* exit checks */
+        /* exit checks */
         {
             uint8_t request_changed =
                 (z->setpoint_c             != z->mode_c_snap_setpoint) ||
@@ -312,7 +313,9 @@ void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c, uint32_t 
 
             if (request_changed || sustainable) {
                 zone_enter_pid(z, ema_t_c);
-                z->pid.integral = z->fan_duty; /* bumpless reverse */
+
+                /* THE FIX: Truly bumpless reverse-seed for the Fan PID */
+                z->pid.integral = 1.0f - PID_KP * (z->setpoint_c - ema_t_c);
                 break;
             }
         }
@@ -434,11 +437,24 @@ static void ControlTask(void *argument)
 /* ============================================================================
  * BUS TASK (I2C Master)
  * ========================================================================== */
+/* I2C bus scanner — TEMPORARY bring-up tool */
+volatile uint8_t g_i2c_found[128];
+volatile uint8_t g_i2c_nfound = 0;
+
+void i2c_scan(void)
+{
+    g_i2c_nfound = 0;
+    for (uint8_t a7 = 1; a7 < 127; a7++) {
+        if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(a7 << 1), 2, 5) == HAL_OK) {
+            g_i2c_found[g_i2c_nfound++] = a7;   /* stores 7-bit addresses */
+        }
+    }
+}
 static void BusTask(void *argument)
 {
+	i2c_scan();
     (void)argument;
-    const uint16_t node_addrs[NUM_REMOTE_NODES] = {0x20, 0x22, 0x24};
-
+    const uint16_t node_addrs[NUM_REMOTE_NODES] = {(0x20 << 1), (0x22 << 1), (0x24 << 1)};
     for(;;) {
         for(int i = 0; i < NUM_REMOTE_NODES; i++) {
             I2C_Telemetry temp_tel;
@@ -448,8 +464,13 @@ static void BusTask(void *argument)
             temp_cmd = g_nodes[i].cmd;
             xSemaphoreGive(xNodeMutex);
 
-            HAL_StatusTypeDef tx_stat = HAL_I2C_Master_Transmit(&hi2c1, node_addrs[i], (uint8_t*)&temp_cmd, sizeof(I2C_Command), 10);
-            HAL_StatusTypeDef rx_stat = HAL_I2C_Master_Receive(&hi2c1, node_addrs[i], (uint8_t*)&temp_tel, sizeof(I2C_Telemetry), 10);
+            /* 2. Execute the physical I2C Write and Read (Safely!) */
+            HAL_StatusTypeDef tx_stat, rx_stat;
+
+            xSemaphoreTake(xI2cMutex, portMAX_DELAY);
+            tx_stat = HAL_I2C_Master_Transmit(&hi2c1, node_addrs[i], (uint8_t*)&temp_cmd, sizeof(I2C_Command), 10);
+            rx_stat = HAL_I2C_Master_Receive(&hi2c1, node_addrs[i], (uint8_t*)&temp_tel, sizeof(I2C_Telemetry), 10);
+            xSemaphoreGive(xI2cMutex);
 
             if (tx_stat == HAL_OK && rx_stat == HAL_OK) {
                 xSemaphoreTake(xNodeMutex, portMAX_DELAY);
@@ -579,7 +600,10 @@ static void UITask(void *argument)
         int heat_pct = (int)(zones[0].heater_duty * 100.0f + 0.5f);
         int fan_pct  = (int)(zones[0].fan_duty    * 100.0f + 0.5f);
 
+        xSemaphoreTake(xI2cMutex, portMAX_DELAY);
         oled_update(tel.adc_raw, vnode, rntc, ema_temp_display, heat_pct, fan_pct, &zones[0]);
+        xSemaphoreGive(xI2cMutex);
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -636,6 +660,7 @@ void ThermalApp_Init(void)
 void ThermalApp_StartTasks(void)
 {
     xCtrlQueue = xQueueCreate(8, sizeof(Event_t));
+    xI2cMutex = xSemaphoreCreateMutex();
     xAdcMutex  = xSemaphoreCreateMutex();
     xNodeMutex = xSemaphoreCreateMutex();
 
