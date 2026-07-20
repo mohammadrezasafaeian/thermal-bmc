@@ -75,17 +75,7 @@ static uint8_t ema_initialized  = 0;
 /* ============================================================================
  * SENSING HELPERS (Adapted for 5V ATmega ADC over I2C)
  * ========================================================================== */
-static float adc_to_rntc_5v(float vnode)
-{
-    if (vnode < 0.001f) vnode = 0.001f;
-    float v_max = THERM_DIV_VSUP - 0.001f;
-    if (vnode > v_max) vnode = v_max;
 
-    float rntc = THERM_RTOP * (vnode / (THERM_DIV_VSUP - vnode));
-    if (rntc <    0.1f) rntc =    0.1f;
-    if (rntc > 5000.0f) rntc = 5000.0f;
-    return rntc;
-}
 
 static float rntc_to_celsius(float rntc)
 {
@@ -94,7 +84,18 @@ static float rntc_to_celsius(float rntc)
     if (inv_T < 1e-6f) inv_T = 1e-6f;
     return (1.0f / inv_T) - 273.15f;
 }
-
+/* ---- Differential contract decode (choice A: wire = counts + 512) ----
+ * counts = (V+ - V-) * 10 * 512/Vrail
+ * V+ = Vrail*R/(330+R),  V- = Vrail*10/340   ->  Vrail cancels:
+ *   d = counts/5120 ;  x = d + 10/340 ;  R = 330*x/(1-x)
+ * Bench anchors: -41 -> 7.1R -> ~34C ; 0 -> 10R -> 25C ; +267 -> 29.3R -> ~0C */
+static float node_counts_to_rntc(int counts)
+{
+    float x = (float)counts / 5120.0f + (10.0f / 340.0f);
+    if (x > 0.999f)  x = 0.999f;
+    if (x < 0.0005f) x = 0.0005f;
+    return 330.0f * x / (1.0f - x);
+}
 static inline float ema_step(float state, float value, float alpha)
 {
     return state + alpha * (value - state);
@@ -158,10 +159,10 @@ static void emit_change_events(ZoneCtrl *z)
 /* ============================================================================
  * FSM HELPERS (Fully Encapsulated)
  * ========================================================================== */
-static FaultReason detect_fault(float vnode, uint32_t fan_rpm){
-    if (vnode > V_OPEN_THRESH)  return FR_NTC_OPEN;
-    if (vnode < V_SHORT_THRESH) return FR_NTC_SHORT;
-    if (fan_rpm < FAN_STALL_RPM) return FR_FAN_OPEN;
+static FaultReason detect_fault(int counts, uint32_t fan_rpm){
+    if (counts > CNT_NTC_OPEN_THRESH)  return FR_NTC_OPEN;
+    if (counts < CNT_NTC_SHORT_THRESH) return FR_NTC_SHORT;
+    if (fan_rpm < FAN_STALL_RPM)       return FR_FAN_OPEN;
     return FR_NONE;
 }
 
@@ -225,8 +226,8 @@ static void zone_enter_fault(ZoneCtrl *z, FaultReason r)
 /* ============================================================================
  * Zone_Tick (The Universal Engine)
  * ========================================================================== */
-void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c, uint32_t fan_rpm){
-    FaultReason fault_candidate = detect_fault(vnode, fan_rpm);
+void Zone_Tick(ZoneCtrl *z, int counts, float raw_t_c, float ema_t_c, uint32_t fan_rpm){
+    FaultReason fault_candidate = detect_fault(counts, fan_rpm);
 
     switch (z->state) {
 
@@ -383,14 +384,20 @@ static void ControlTask(void *argument)
                 online = g_nodes[i].is_online;
                 xSemaphoreGive(xNodeMutex);
 
-                float vnode = 0.0f;
-                float temp_c = 0.0f;
+
+                int counts = 0;
+                float temp_c = 0.0f, vnode_log = 0.0f;
                 uint32_t fan_rpm = 0;
 
                 if (online) {
-                    /* Convert 10-bit ATmega ADC to Voltage and Temp */
-                    vnode = 5.0f * ((float)tel.adc_raw / 1023.0f);
-                    temp_c = rntc_to_celsius(adc_to_rntc_5v(vnode));
+                    counts  = (int)tel.adc_raw - 512;          /* contract A */
+                    float r = node_counts_to_rntc(counts);
+                    temp_c  = rntc_to_celsius(r);
+                    /* reconstructed node voltage, LOGGING ONLY (parser
+                       compatibility): v+ = vrail*(counts/5120 + 10/340),
+                       vrail nominal 5.0 - absolute value approximate,
+                       trend faithful */
+                    vnode_log = 5.0f * ((float)counts/5120.0f + 10.0f/340.0f);
                     fan_rpm = tel.tach_pulses * 30;
                 }
 
@@ -403,7 +410,7 @@ static void ControlTask(void *argument)
                 if (!online) {
                     zone_enter_fault(&zones[i], FR_NODE_OFFLINE);
                 } else {
-                    Zone_Tick(&zones[i], vnode, temp_c, zones[i].pid_temp, fan_rpm);
+                    Zone_Tick(&zones[i], counts, temp_c, zones[i].pid_temp, fan_rpm);
                 }
 
                 /* Tier 3 hard safety backstop (Per Zone) */
@@ -420,7 +427,7 @@ static void ControlTask(void *argument)
 
                 /* For portfolio logging, we capture Zone 0's data */
                 if (i == 0) {
-                    log_sample(temp_c, zones[i].pid_temp, vnode, zones[i].fan_duty,
+                    log_sample(temp_c, zones[i].pid_temp, counts, zones[i].fan_duty,
                                zones[i].heater_duty, zones[i].requested_heater_duty,
                                zones[i].setpoint_c, fan_rpm);
                     emit_change_events(&zones[i]);
@@ -574,11 +581,13 @@ static void UITask(void *argument)
         online = g_nodes[0].is_online;
         xSemaphoreGive(xNodeMutex);
 
+        int counts = 0;
         float temp_c = 0.0f, vnode = 0.0f, rntc = 0.0f;
         if (online) {
-            vnode = 5.0f * ((float)tel.adc_raw / 1023.0f);
-            rntc = adc_to_rntc_5v(vnode);
+            counts = (int)tel.adc_raw - 512;
+            rntc   = node_counts_to_rntc(counts);
             temp_c = rntc_to_celsius(rntc);
+            vnode  = 5.0f * ((float)counts/5120.0f + 10.0f/340.0f);
         }
 
         if (!ema_initialized) {

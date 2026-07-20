@@ -78,8 +78,12 @@ typedef enum {
     FR_NODE_OFFLINE     = 6
 } FaultReason;
 
-#define V_OPEN_THRESH         2.5f
-#define V_SHORT_THRESH        0.05f
+/* NTC fault thresholds, count domain (rail-immune, signed counts).
+ * Anchors: short=-151, 80C=-126 (gap 25) ; open=+511 SAT, 0C=+267.
+ * PLACEMENT + JUSTIFICATION: ___[#12 - two numbers, one sentence
+ * each: where in the gap and why, vs noise + FAULT_TRIP_N]___    */
+#define CNT_NTC_SHORT_THRESH  (-140)   /* TUTOR PLACEHOLDER - ratify or move */
+#define CNT_NTC_OPEN_THRESH   (+400)   /* TUTOR PLACEHOLDER - ratify or move */
 #define FAN_STALL_RPM         300
 
 #define FAULT_TRIP_N          3
@@ -215,6 +219,6 @@ typedef enum {
 void ThermalApp_Init(void);
 void ThermalApp_StartTasks(void);
 void ThermalApp_TickISR(void);
-void Zone_Tick(ZoneCtrl *z, float vnode, float raw_t_c, float ema_t_c, uint32_t fan_rpm);
+void Zone_Tick(ZoneCtrl *z, int counts, float raw_t_c, float ema_t_c, uint32_t fan_rpm);
 
 #endif /* INC_THERMAL_APP_H_ */
