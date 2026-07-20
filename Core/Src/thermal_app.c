@@ -469,6 +469,7 @@ static void BusTask(void *argument)
 
             xSemaphoreTake(xI2cMutex, portMAX_DELAY);
             tx_stat = HAL_I2C_Master_Transmit(&hi2c1, node_addrs[i], (uint8_t*)&temp_cmd, sizeof(I2C_Command), 10);
+            osDelay(1);
             rx_stat = HAL_I2C_Master_Receive(&hi2c1, node_addrs[i], (uint8_t*)&temp_tel, sizeof(I2C_Telemetry), 10);
             xSemaphoreGive(xI2cMutex);
 
