@@ -12,3 +12,10 @@ Release/
 Thumbs.db
 .metadata/
 .mxproject
+
+# Host test build
+build/
+
+# Debugger dumps and scratch
+scripts/*.bin
+scripts/debug.log
