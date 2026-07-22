@@ -648,10 +648,11 @@ void ThermalApp_Init(void)
         thermal_log_magic = THERMAL_LOG_MAGIC;
     }
 
+    /* String literals live for the whole program, so no copy is needed. */
+    static const char *const zone_names[NUM_REMOTE_NODES] = { "Z0", "Z1", "Z2" };
+
     for (int i = 0; i < NUM_REMOTE_NODES; i++) {
-        char name_buf[4];
-        snprintf(name_buf, sizeof(name_buf), "Z%d", i);
-        zones[i].name = strdup(name_buf); /* Fine for embedded if called once */
+        zones[i].name = zone_names[i];
         zones[i].state = ST_IDLE;
         zones[i].fault_reason = FR_NONE;
         zones[i].setpoint_c = 30.0f;
