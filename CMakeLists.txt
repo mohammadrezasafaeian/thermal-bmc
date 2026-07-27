@@ -19,3 +19,10 @@ add_library(warnings INTERFACE)
 target_compile_options(warnings INTERFACE
     -Wall -Wextra -Wshadow -Wconversion -Wno-sign-conversion)
 
+add_library(pid STATIC Core/Src/pid.c)
+target_include_directories(pid PUBLIC Core/Inc)
+
+add_executable(test_pid test/test_pid.c)
+target_link_libraries(test_pid PRIVATE pid unity warnings m)
+add_test(NAME pid COMMAND test_pid)
+
