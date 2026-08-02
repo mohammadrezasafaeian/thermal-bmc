@@ -26,3 +26,18 @@ add_executable(test_pid test/test_pid.c)
 target_link_libraries(test_pid PRIVATE pid unity warnings m)
 add_test(NAME pid COMMAND test_pid)
 
+# Stand-ins for everything below the firmware: HAL, FreeRTOS, I2C nodes, OLED.
+# test/fakes comes first on the include path, so #include "FreeRTOS.h" resolves
+# to ours. PUBLIC means anything linking these inherits that ordering.
+add_library(fakes STATIC
+    test/fakes/fake_hal.c
+    test/fakes/fake_rtos.c
+    test/fakes/fake_i2c.c
+    test/fakes/fake_oled.c
+    test/fakes/fake_cmsis.c)
+target_include_directories(fakes PUBLIC test/fakes Core/Inc)
+
+# The firmware itself, compiled from Core/Src - not a copy.
+add_library(thermal_app STATIC Core/Src/thermal_app.c)
+target_link_libraries(thermal_app PUBLIC fakes pid m)
+
