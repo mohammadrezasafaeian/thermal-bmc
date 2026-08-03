@@ -41,3 +41,7 @@ target_include_directories(fakes PUBLIC test/fakes Core/Inc)
 add_library(thermal_app STATIC Core/Src/thermal_app.c)
 target_link_libraries(thermal_app PUBLIC fakes pid m)
 
+add_executable(test_nodes test/test_nodes.c)
+target_link_libraries(test_nodes PRIVATE thermal_app unity warnings)
+add_test(NAME nodes COMMAND test_nodes)
+
