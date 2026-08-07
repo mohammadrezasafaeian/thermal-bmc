@@ -34,7 +34,8 @@ add_library(fakes STATIC
     test/fakes/fake_rtos.c
     test/fakes/fake_i2c.c
     test/fakes/fake_oled.c
-    test/fakes/fake_cmsis.c)
+    test/fakes/fake_cmsis.c
+    test/fakes/plant.c)
 target_include_directories(fakes PUBLIC test/fakes Core/Inc)
 
 # The firmware itself, compiled from Core/Src - not a copy.
@@ -45,3 +46,6 @@ add_executable(test_nodes test/test_nodes.c)
 target_link_libraries(test_nodes PRIVATE thermal_app unity warnings)
 add_test(NAME nodes COMMAND test_nodes)
 
+add_executable(test_loop test/test_loop.c)
+target_link_libraries(test_loop PRIVATE thermal_app unity warnings)
+add_test(NAME loop COMMAND test_loop ${CMAKE_BINARY_DIR}/sim_log.csv)
