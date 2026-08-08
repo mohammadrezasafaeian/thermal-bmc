@@ -37,7 +37,7 @@ static struct {
 static float noise_lsb(void)
 {
     s_p.rng = s_p.rng * 1664525u + 1013904223u;
-    return (float)((int)((s_p.rng >> 16) & 0x3u) - 1);   /* -1, 0, +1, +2 */
+    return (float)((int)((s_p.rng >> 16) % 3u) - 1);     /* -1, 0, +1, mean 0 */
 }
 
 void plant_init(float ambient_c, int with_noise, int with_fan)

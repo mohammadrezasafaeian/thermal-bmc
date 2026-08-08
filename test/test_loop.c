@@ -27,6 +27,20 @@ extern I2C_HandleTypeDef hi2c1;
 static FILE *s_csv;
 
 
+/* Mirror of the firmware's sensor decode (thermal_app.c:80-99), which is
+   static. The test needs it to know what temperature the controller saw. */
+static float decode_counts_to_celsius(int counts)
+{
+    float x = (float)counts / 5120.0f + (10.0f / 340.0f);
+    if (x > 0.999f)  x = 0.999f;
+    if (x < 0.0005f) x = 0.0005f;
+    float rntc = 330.0f * x / (1.0f - x);
+
+    float inv_t = (1.0f / 298.15f) + (1.0f / 3500.0f) * logf(rntc / 10.0f);
+    if (inv_t < 1e-6f) inv_t = 1e-6f;
+    return (1.0f / inv_t) - 273.15f;
+}
+
 
 void setUp(void)
 {
@@ -64,9 +78,13 @@ static void loop_tick(void)
     g_nodes[ZONE].is_online = 1;
     xSemaphoreGive(MUTEX_NODE);
 
-    /* 3. firmware decodes and runs its state machine */
+    /* 3. firmware decodes and runs its state machine.
+     *    temp_c comes from the DECODED counts, not from plant_temp_c(): the
+     *    controller must only ever see what the sensor actually reported,
+     *    noise and quantisation included. Reading the plant directly would
+     *    hand the PID a perfect measurement no real system ever gets. */
     int   decoded = (int)tel.adc_raw - 512;      /* contract A */
-    float temp_c  = plant_temp_c();
+    float temp_c  = decode_counts_to_celsius(decoded);
 
     if (z->state == ST_PID || z->state == ST_THROTTLE) {
         z->pid_temp = z->pid_temp + 0.02f * (temp_c - z->pid_temp);
@@ -170,7 +188,10 @@ static void test_closed_loop_regulates_to_setpoint(void)
 
 
 /* ---------------------------------------------------------------------------
- * 5. Sensor noise must not knock the loop off the setpoint.
+ * 5. ADC noise reaches the controller but does not destabilise it.
+ *
+ * The +/-1 LSB jitter is mean-zero, so the EMA should absorb it: the loop
+ * still holds the setpoint, and the fan twitches without hunting.
  * ------------------------------------------------------------------------ */
 static void test_noise_does_not_destabilise(void)
 {
@@ -186,6 +207,37 @@ static void test_noise_does_not_destabilise(void)
     TEST_ASSERT_TRUE_MESSAGE(err < 2.5f, "noise destabilised the loop");
     TEST_ASSERT_TRUE(zones[ZONE].fan_duty > 0.05f);
 
+    /* Bounded hunting: over the last 200 s the fan must keep moving - proof
+       the noise really is on the control path and not being read around -
+       yet stay well short of slamming between limits. */
+    float lo = 1.0f, hi = 0.0f;
+    for (int i = 0; i < 200; i++) {
+        loop_tick();
+        if (zones[ZONE].fan_duty < lo) lo = zones[ZONE].fan_duty;
+        if (zones[ZONE].fan_duty > hi) hi = zones[ZONE].fan_duty;
+    }
+    float swing = hi - lo;
+    TEST_ASSERT_TRUE_MESSAGE(swing > 0.0005f,
+        "fan perfectly steady - noise is not reaching the controller");
+    TEST_ASSERT_TRUE_MESSAGE(swing < 0.20f, "fan hunting on sensor noise");
+}
+
+
+/* The jitter must be mean-zero. A biased 'noise' source is a calibration
+   offset wearing a disguise, and it would quietly move the setpoint. */
+static void test_noise_is_unbiased(void)
+{
+    plant_init(30.0f, 1, 0);
+
+    long sum = 0;
+    const int N = 4000;
+    for (int i = 0; i < N; i++) sum += plant_temp_to_counts(30.0f);
+
+    plant_init(30.0f, 0, 0);
+    long clean = plant_temp_to_counts(30.0f) * (long)N;
+
+    float bias = (float)(sum - clean) / (float)N;
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 0.0f, bias);
 }
 
 
@@ -220,6 +272,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_one_tau_reaches_63_percent);
     RUN_TEST(test_closed_loop_regulates_to_setpoint);
     RUN_TEST(test_noise_does_not_destabilise);
+    RUN_TEST(test_noise_is_unbiased);
     RUN_TEST(test_hard_safety_cutoff);
 
     if (s_csv) fclose(s_csv);
