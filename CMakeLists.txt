@@ -49,3 +49,8 @@ add_test(NAME nodes COMMAND test_nodes)
 add_executable(test_loop test/test_loop.c)
 target_link_libraries(test_loop PRIVATE thermal_app unity warnings)
 add_test(NAME loop COMMAND test_loop ${CMAKE_BINARY_DIR}/sim_log.csv)
+
+# Replays the recorded scenario and dumps it in the firmware's black-box
+# format, so the same parser renders simulation and hardware alike.
+add_executable(test_sim_run test/test_sim_run.c)
+target_link_libraries(test_sim_run PRIVATE thermal_app warnings)

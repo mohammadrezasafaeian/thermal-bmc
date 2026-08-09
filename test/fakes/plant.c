@@ -25,6 +25,7 @@
 
 static struct {
     float temp_c;
+    float ambient_c;
     float heater_delay[DELAY_SLOTS];
     int   delay_head;
     int   noise_on;
@@ -43,7 +44,8 @@ static float noise_lsb(void)
 void plant_init(float ambient_c, int with_noise, int with_fan)
 {
     memset(&s_p, 0, sizeof(s_p));
-    s_p.temp_c   = ambient_c;
+    s_p.temp_c    = ambient_c;
+    s_p.ambient_c = ambient_c;
     s_p.noise_on = with_noise;
     s_p.fan_on   = with_fan;
     s_p.rng      = 12345u;
@@ -62,7 +64,7 @@ void plant_step(float heater_duty, float fan_duty)
     float cooling = s_p.fan_on ? (PLANT_FAN_K * fan_duty) : 0.0f;
 
     float dT = (PLANT_TS / PLANT_TAU_S)
-             * (rise - (s_p.temp_c - PLANT_AMBIENT_C) * (1.0f + cooling));
+             * (rise - (s_p.temp_c - s_p.ambient_c) * (1.0f + cooling));
 
     s_p.temp_c += dT;
 }

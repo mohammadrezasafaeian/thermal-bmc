@@ -115,8 +115,8 @@ fix was verified on hardware with a +0.000 step.
 
 ![Detail](docs/run1_detail.png)
 *Left: FSM with live transition counts for this run. Right:*
-*sensor-fault zoom — NTC short, immediate heater cutoff, debounced*
-*recovery after the fault clears.*
+*sensor-fault zoom — the node dropping off the I2C bus, heater cut*
+*immediately, telemetry blanked while it was gone, debounced recovery.*
 
 ### Black-box logging
 
@@ -192,6 +192,43 @@ anchors independently (0 °C → 267 counts, 25 °C → 0).
 The last two were bugs in the tests, not the firmware — which is the
 point. A green suite proves nothing until you break the code on purpose
 and watch it go red.
+
+### Model validation — simulation against hardware
+
+The same scenario, replayed against the plant model on a PC and rendered by
+the same parser. `test_sim_run` writes the firmware's own black-box binary
+layout, so `parse_struct_dump.py` reads a simulated run exactly as it reads a
+dump pulled over SWD — nothing in the reporting path is special-cased.
+
+![Simulated run](docs/sim_run_overview.png)
+
+| KPI | Hardware | Simulation |
+|---|---|---|
+| Run length | 31:30 | 32:09 |
+| Mean \|error\| in PID | 0.52 °C | 0.35 °C |
+| Throttle cycles | 1 | 1 |
+| **Handover step** | **+0.000** | **+0.000** |
+| Load refused | 22 duty·s | 21 duty·s |
+| Faults | 1/1 cleared | 1/1 cleared |
+
+Same setpoints, same load steps, the same differential ADC path — °C to counts
+to wire to decode, quantisation and ±1 LSB jitter included — and the same
+node-offline fault that actually happened during bring-up.
+
+What this does and does not establish: the plant constants come from one step
+test, the airflow blockage is a scripted guess at a disturbance nobody
+measured, and the ambient was read off the recording. The agreement worth
+pointing at is the **handover step at +0.000 in both**, because that tests the
+controller's bumpless transfer rather than the quality of the plant fit. The
+mean error differs by 0.17 °C — the simulated sensor is quieter than the real
+one, which is expected when the noise model is ±1 LSB of uniform jitter and
+the bench has thermal drift, contact resistance and a fan that moves air
+unevenly.
+
+Doing this found a real bug in the model: `plant_step()` decayed toward the
+compile-time ambient constant rather than the ambient the run was initialised
+with, so any scenario not starting at 25 °C settled at the wrong temperature.
+Invisible until a run was replayed at the actual bench ambient of 29.6 °C.
 
 ---
 
