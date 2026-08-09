@@ -6,9 +6,20 @@
  * either the model or my understanding of the loop is wrong - and that is
  * worth knowing before trusting any of it.
  *
- * Everything the hardware run had is kept: the same setpoints, the same
- * differential ADC path (degC -> counts -> wire -> decode), the same
- * quantisation, the same +/-1 LSB jitter.
+ * Everything the hardware run had is kept: the same setpoints, the same load
+ * steps, the same differential ADC path (degC -> counts -> wire -> decode),
+ * the same quantisation and +/-1 LSB jitter - and, crucially, the node-side
+ * EMA that sits between them.
+ *
+ * That filter is easy to leave out and it changes everything. zone1/Zone1.c
+ * samples at 100 Hz and runs adc_ema += 0.05*(raw - adc_ema) before rounding
+ * to a wire count. For white noise an EMA attenuates by sqrt(a/(2-a)), so
+ * a=0.05 divides the noise by 6.2: +/-1 LSB of raw jitter becomes ~0.13 LSB
+ * at the output, which mostly disappears in the rounding. The result on the
+ * bench is a clean staircase that steps only when the filtered value truly
+ * crosses a count boundary. Inject noise and quantise in the same breath -
+ * as an earlier version of this file did - and you get a dithering trace
+ * that looks nothing like the hardware.
  *
  *   ./build/test_sim_run sim_run          -> sim_run.bin, sim_run_events.bin
  *   python3 scripts/parse_struct_dump.py sim_run.bin --events sim_run_events.bin -o sim_run
@@ -47,24 +58,29 @@ static float decode_counts_to_celsius(int counts)
 /* ---- the recorded run, as a script -------------------------------------
  * Timings and setpoints taken from the hardware capture so the two figures
  * can be laid side by side.                                              */
+#define T_SETPOINT     22      /* setpoint 30 -> 34, a few ticks after start */
 #define T_START        20      /* start request                            */
-#define T_LOAD_UP     600      /* user raises the load                     */
-#define T_FAN_BLOCK  1010      /* airflow degraded -> throttle should engage */
-#define T_FAN_CLEAR  1660      /* airflow restored                         */
-#define T_SETPOINT   1665      /* setpoint moved 32 -> 33                  */
-#define T_NODE_DROP  1669      /* node goes offline (the real bring-up fault) */
-#define T_NODE_BACK  1798
-#define T_STOP       1890
-#define T_END        1930
+#define T_LOAD_2       880     /* user raises the load 0.2 -> 0.3          */
+#define T_LOAD_3      1230     /* and again 0.3 -> 0.4                     */
+#define T_FAN_BLOCK   1240     /* airflow degraded -> throttle engages     */
+#define T_FAN_CLEAR   1628     /* airflow restored                         */
+#define T_NODE_DROP   1669     /* node goes offline (the real bring-up fault) */
+#define T_NODE_BACK   1798
+#define T_STOP        1860
+#define T_END         1889
 
-static void log_sample_sim(float temp_c, float ema, float vnode, float fan,
+/* The node samples 100x per control period and filters before it rounds. */
+#define NODE_SUBSAMPLES 100
+#define NODE_EMA_ALPHA  0.05f
+
+static void log_sample_sim(float temp_c, float ema, float counts, float fan,
                            float heater, float req, float setpoint, uint32_t rpm)
 {
     uint32_t i = thermal_log_idx % THERM_LOG_LEN;
     thermal_log[i].time_s      = (float)HAL_GetTick() * 0.001f;
     thermal_log[i].temp_c      = temp_c;
     thermal_log[i].temp_ema    = ema;
-    thermal_log[i].vnode       = vnode;
+    thermal_log[i].vnode       = counts;
     thermal_log[i].fan_duty    = fan;
     thermal_log[i].heater_duty = heater;
     thermal_log[i].heater_req  = req;
@@ -96,11 +112,20 @@ int main(int argc, char **argv)
     /* noise on, fan cooling on - the measured configuration */
     /* Ambient taken from the recorded run: the capture starts at ~29.8 C,
        which is a Tehran summer bench, not the 25 C nominal. */
-    plant_init(29.6f, 1, 1);
+    /* Ambient 31.0 C, read off the start of the recording. The bench was a
+       Tehran summer afternoon and the heater had been run before, so the
+       block never returned to the 25 C nominal. That initial condition is
+       the only free parameter here: with it, K=8.2 reproduces the recorded
+       steady state at load 0.4; without it, the run is unreachable (29.6 +
+       8.2*0.4 = 32.9 C, below the 34 C the hardware actually held). */
+    plant_init(31.0f, 1, 1);
+
+    /* Seeded the way the node seeds it: one conversion, no cold ramp. */
+    float node_ema = (float)plant_temp_to_counts(plant_temp_c());
 
     ZoneCtrl *z = &zones[ZONE];
-    z->setpoint_c            = 32.0f;
-    z->requested_heater_duty = 0.44f;
+    z->setpoint_c            = 30.0f;
+    z->requested_heater_duty = 0.20f;
 
     uint8_t last_state = 0xFF, last_fault = 0xFF, online = 1;
     float   last_setpoint = -1000.0f;
@@ -110,16 +135,24 @@ int main(int argc, char **argv)
 
         /* ---- scripted disturbances ---------------------------------- */
         if (t == T_START)      z->start_req = 1;
-        if (t == T_LOAD_UP)    z->requested_heater_duty = 0.66f;
-        if (t == T_FAN_BLOCK)  airflow = 0.62f;   /* fan moved away       */
-        if (t == T_FAN_CLEAR)  airflow = 1.0f;
         if (t == T_SETPOINT)   z->setpoint_c = 33.0f;
+        if (t == T_LOAD_2)     z->requested_heater_duty = 0.35f;
+        if (t == T_LOAD_3)     z->requested_heater_duty = 0.55f;
+        if (t == T_FAN_BLOCK)  airflow = 0.30f;   /* fan moved away       */
+        if (t == T_FAN_CLEAR)  airflow = 1.0f;
         if (t == T_NODE_DROP)  { fake_i2c_set_present(ZONE, 0); }
         if (t == T_NODE_BACK)  { fake_i2c_set_present(ZONE, 1); }
         if (t == T_STOP)       z->stop_req = 1;
 
-        /* ---- sensor: plant degC -> counts -> wire -------------------- */
-        int      counts = plant_temp_to_counts(plant_temp_c());
+        /* ---- sensor: the node's own loop, 100 Hz, filtered then rounded.
+         *      The plant moves negligibly across 10 ms against tau=111 s, so
+         *      the temperature is held while the ADC noise is redrawn each
+         *      conversion - which is what the hardware actually experiences. */
+        for (int k = 0; k < NODE_SUBSAMPLES; k++) {
+            float raw = (float)plant_temp_to_counts(plant_temp_c());
+            node_ema += NODE_EMA_ALPHA * (raw - node_ema);
+        }
+        int      counts = (int)(node_ema + (node_ema >= 0.0f ? 0.5f : -0.5f));
         uint16_t wire   = plant_counts_to_wire(counts);
         fake_i2c_set_telemetry(ZONE, wire, plant_fan_rpm_to_tach(z->fan_duty));
 
@@ -135,13 +168,12 @@ int main(int argc, char **argv)
 
         /* ---- firmware decode + FSM ----------------------------------- */
         int      decoded = 0;
-        float    temp_c  = 0.0f, vnode = 0.0f;
+        float    temp_c  = 0.0f;
         uint32_t rpm     = 0;
 
         if (online) {
             decoded = (int)tel.adc_raw - 512;
             temp_c  = decode_counts_to_celsius(decoded);
-            vnode   = 5.0f * ((float)decoded / 5120.0f + 10.0f / 340.0f);
             rpm     = (uint32_t)tel.tach_pulses * 30u;
 
             if (z->state == ST_PID || z->state == ST_THROTTLE)
@@ -169,8 +201,11 @@ int main(int argc, char **argv)
         if (z->setpoint_c != last_setpoint){ event_sim(4, 0, z->setpoint_c);
                                              last_setpoint = z->setpoint_c; }
 
-        log_sample_sim(temp_c, z->pid_temp, vnode, z->fan_duty, z->heater_duty,
-                       z->requested_heater_duty, z->setpoint_c, rpm);
+        /* The firmware logs raw signed counts in this field, not a
+           reconstructed voltage - see the log_sample call in ControlTask. */
+        log_sample_sim(temp_c, z->pid_temp, (float)decoded, z->fan_duty,
+                       z->heater_duty, z->requested_heater_duty,
+                       z->setpoint_c, rpm);
 
         /* ---- actuators drive the plant into the next second ---------- */
         plant_step(z->heater_duty, z->fan_duty * airflow);

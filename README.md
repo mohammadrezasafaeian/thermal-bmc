@@ -204,31 +204,60 @@ dump pulled over SWD — nothing in the reporting path is special-cased.
 
 | KPI | Hardware | Simulation |
 |---|---|---|
-| Run length | 31:30 | 32:09 |
-| Mean \|error\| in PID | 0.52 °C | 0.35 °C |
-| Throttle cycles | 1 | 1 |
+| Run length | 31:30 | 31:28 |
 | **Handover step** | **+0.000** | **+0.000** |
-| Load refused | 22 duty·s | 21 duty·s |
+| Throttle cycles | 1 | 1 |
+| Throttle dwell | 320 s | 324 s |
 | Faults | 1/1 cleared | 1/1 cleared |
 
-Same setpoints, same load steps, the same differential ADC path — °C to counts
-to wire to decode, quantisation and ±1 LSB jitter included — and the same
-node-offline fault that actually happened during bring-up.
+#### The filter that makes the sensor trace look right
 
-What this does and does not establish: the plant constants come from one step
-test, the airflow blockage is a scripted guess at a disturbance nobody
-measured, and the ambient was read off the recording. The agreement worth
-pointing at is the **handover step at +0.000 in both**, because that tests the
-controller's bumpless transfer rather than the quality of the plant fit. The
-mean error differs by 0.17 °C — the simulated sensor is quieter than the real
-one, which is expected when the noise model is ±1 LSB of uniform jitter and
-the bench has thermal drift, contact resistance and a fan that moves air
-unevenly.
+The first version of this simulator produced a noisy, dithering temperature
+trace that looked nothing like the bench. The bench trace is a clean staircase
+— and the reason is a block that had been left out of the model entirely.
+
+`zone1/Zone1.c` samples the differential ADC at 100 Hz and runs
+`adc_ema += 0.05*(raw - adc_ema)` **before** rounding to a wire count. For
+white noise an EMA attenuates by `sqrt(a/(2-a))`, so `a = 0.05` divides it by
+6.2: ±1 LSB of raw ADC jitter becomes about 0.13 LSB at the filter output,
+which then mostly disappears in the rounding. The count changes only when the
+*filtered* value genuinely crosses a boundary.
+
+Measured in simulation, before and after adding that stage:
+
+| | count changes on | median dwell on a level |
+|---|---|---|
+| noise injected then rounded | ~100 % of samples | 1 s |
+| through the node's EMA first | **1 % of samples** | **63 s** |
+
+Same injected noise in both cases. The difference is entirely the filter. It
+is also a load-bearing fact for the fault thresholds elsewhere in this
+project: single-count margins between "hottest legitimate" and "shorted" only
+survive because a 6× noise reduction sits upstream of them.
+
+#### What this does and does not establish
+
+The plant constants come from one step test, and the airflow blockage is a
+scripted guess at a disturbance nobody measured. One initial condition is
+fitted: the ambient is set to 31 °C, read off the start of the recording,
+because the bench was a Tehran summer afternoon and the block had not returned
+to the 25 °C nominal.
+
+That ambient is not cosmetic. With the measured `K = 8.2 °C/duty`, a 25 °C
+ambient cannot reach the operating point the hardware actually held — even
+with the fan off, `25 + 8.2 × 0.4 = 28.3 °C`. Either the ambient was much
+higher than nominal, or `K` is larger at these duties than the low-duty step
+test suggested. The recording alone cannot separate those, and this is
+recorded here rather than hidden in a tuned constant.
+
+The agreement worth pointing at is the **handover step at +0.000 in both**,
+because that tests the controller's bumpless transfer rather than the quality
+of the plant fit.
 
 Doing this found a real bug in the model: `plant_step()` decayed toward the
 compile-time ambient constant rather than the ambient the run was initialised
 with, so any scenario not starting at 25 °C settled at the wrong temperature.
-Invisible until a run was replayed at the actual bench ambient of 29.6 °C.
+Invisible until a run was replayed at the actual bench ambient.
 
 ---
 
